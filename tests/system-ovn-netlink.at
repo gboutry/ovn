@@ -29,6 +29,102 @@ AT_KEYWORDS([netlink-neighbors netlink-dump-error])
 check ovstest test-ovn-netlink neighbor-dump-script complete
 AT_CLEANUP
 
+AT_SETUP([next-hop-neighbor - parse cache information])
+AT_KEYWORDS([netlink-neighbors next-hop-neighbor])
+check ovstest test-ovn-netlink neighbor-parse
+AT_CLEANUP
+
+AT_SETUP([next-hop-neighbor - read-only neighbor snapshot])
+AT_KEYWORDS([netlink-neighbors next-hop-neighbor])
+
+check ip link add nh-test type dummy
+on_exit 'ip link del nh-test'
+check ip link set nh-test up
+check ip neigh add 192.0.2.1 lladdr 02:00:00:00:00:01 \
+    dev nh-test nud permanent
+check ip neigh add 192.0.2.2 lladdr 02:00:00:00:00:02 \
+    dev nh-test nud noarp
+if_index=$(netlink_if_index nh-test)
+
+dnl A read-only dump includes both administrative and OVN-like entries.
+OVS_WAIT_FOR_OUTPUT([ovstest test-ovn-netlink neighbor-read $if_index | sort],
+    [0], [dnl
+192.0.2.1 02:00:00:00:00:01 state=128
+192.0.2.2 02:00:00:00:00:02 state=64
+])
+OVN_NEIGH_EQUAL([nh-test], [nud all], [192.0.2], [dnl
+192.0.2.1 lladdr 02:00:00:00:00:01 PERMANENT
+192.0.2.2 lladdr 02:00:00:00:00:02 NOARP])
+
+dnl Exclusive solicitation cannot replace an existing administrative entry.
+AT_CHECK([ovstest test-ovn-netlink neighbor-resolve $if_index 192.0.2.1],
+    [0], [exists
+])
+OVN_NEIGH_EQUAL([nh-test], [nud permanent], [192.0.2.1], [dnl
+192.0.2.1 lladdr 02:00:00:00:00:01 PERMANENT])
+AT_CLEANUP
+
+AT_SETUP([next-hop-neighbor - resolve cold numbered peers])
+AT_KEYWORDS([netlink-neighbors next-hop-neighbor])
+CHECK_VRF()
+ADD_NAMESPACES(nh-peer)
+
+check ip link add nh-vrf type vrf table 42
+on_exit 'ip link del nh-vrf'
+check ip link set nh-vrf up
+check ip link add nh-local type veth peer name nh-remote
+on_exit 'ip link del nh-local'
+check ip link set nh-local master nh-vrf
+check ip link set nh-local address 02:00:00:00:00:10
+check ip link set nh-local up
+check ip link set nh-remote netns nh-peer
+NS_CHECK_EXEC([nh-peer], [ip link set nh-remote address 02:00:00:00:00:01])
+NS_CHECK_EXEC([nh-peer], [ip addr add 192.0.2.1/32 dev nh-remote])
+NS_CHECK_EXEC([nh-peer], [ip link set nh-remote up])
+if_index=$(netlink_if_index nh-local)
+
+for numbered in 192.0.2.10/32 192.0.2.0/31 192.0.2.2/30; do
+    local_ip=${numbered%/*}
+    check ip addr add $numbered dev nh-local
+    if test "$numbered" = 192.0.2.10/32; then
+        check ip route add table 42 192.0.2.1/32 dev nh-local \
+            src $local_ip scope link
+    fi
+    NS_CHECK_EXEC([nh-peer], [ip route add $local_ip/32 dev nh-remote \
+        src 192.0.2.1 scope link])
+    NS_CHECK_EXEC([nh-peer], [ip neigh flush dev nh-remote])
+    check ip -4 neigh flush dev nh-local
+    AT_CHECK([ip -4 neigh show 192.0.2.1 dev nh-local], [0], [])
+
+    check ovstest test-ovn-netlink neighbor-resolve $if_index 192.0.2.1
+    OVS_WAIT_UNTIL([ip neigh show 192.0.2.1 dev nh-local | \
+        grep -q 'lladdr 02:00:00:00:00:01.*REACHABLE'])
+    dnl Learning this exact peer entry demonstrates that the kernel request
+    dnl used the numbered host identity, rather than an all-zero source.
+    NS_CHECK_EXEC([nh-peer], [ip neigh show $local_ip dev nh-remote | \
+        grep -q 'lladdr 02:00:00:00:00:10'])
+
+    check ip neigh del 192.0.2.1 dev nh-local
+    NS_CHECK_EXEC([nh-peer], [ip neigh flush dev nh-remote])
+    NS_CHECK_EXEC([nh-peer], [ip route del $local_ip/32 dev nh-remote])
+    if test "$numbered" = 192.0.2.10/32; then
+        check ip route del table 42 192.0.2.1/32 dev nh-local
+    fi
+    check ip addr del $numbered dev nh-local
+done
+AT_CLEANUP
+
+AT_SETUP([next-hop-neighbor - independent notification consumers])
+AT_KEYWORDS([netlink-neighbors next-hop-neighbor])
+
+check ip link add nh-test type dummy
+on_exit 'ip link del nh-test'
+check ip link set nh-test up
+check ovstest test-ovn-netlink neighbor-notifier-fanout \
+    'ip neigh add 192.0.2.1 lladdr 02:00:00:00:00:01 dev nh-test' \
+    'ip neigh replace 192.0.2.1 lladdr 02:00:00:00:00:02 dev nh-test'
+AT_CLEANUP
+
 AT_SETUP([sync netlink neighbors - learn VXLAN VTEP neighbors])
 AT_KEYWORDS([netlink-neighbors])
 

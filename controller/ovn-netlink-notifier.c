@@ -82,6 +82,12 @@ static struct ovn_netlink_notifier notifiers[OVN_NL_NOTIFIER_MAX] = {
         .change_handler = ovn_netlink_neighbor_change_handler,
         .name = "neighbor",
     },
+    [OVN_NL_NOTIFIER_ROUTE_NEIGHBOR] = {
+        .group = RTNLGRP_NEIGH,
+        .msgs = VECTOR_EMPTY_INITIALIZER(struct ne_table_msg),
+        .change_handler = ovn_netlink_neighbor_change_handler,
+        .name = "route-neighbor",
+    },
     [OVN_NL_NOTIFIER_NEXTHOP] = {
         .group = RTNLGRP_NEXTHOP,
         .msgs = VECTOR_EMPTY_INITIALIZER(struct nh_table_msg),
@@ -296,6 +302,7 @@ ovn_netlink_notifier_flush(enum ovn_netlink_notifier_type type)
         break;
     }
     case OVN_NL_NOTIFIER_NEIGHBOR:
+    case OVN_NL_NOTIFIER_ROUTE_NEIGHBOR:
     case OVN_NL_NOTIFIER_MAX:
         break;
     }

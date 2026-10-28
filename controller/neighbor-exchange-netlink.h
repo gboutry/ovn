@@ -41,6 +41,8 @@ struct ne_nl_received_neigh {
     uint8_t  type;          /* A value out of 'rtm_type' from linux/rtnetlink.h
                              * e.g., RTN_UNICAST, RTN_MULTICAST. */
     uint32_t nh_id;         /* ID of nexthop group if present, 0 otherwise. */
+    bool has_cacheinfo;     /* Whether confirmation age is available. */
+    uint64_t confirmed_msec; /* Milliseconds since kernel confirmation. */
 };
 
 /* A digested version of a neigh message sent down by the kernel to indicate
@@ -53,6 +55,9 @@ struct ne_table_msg {
 int ne_nl_sync_neigh(uint8_t family, int32_t if_index,
                      const struct hmap *neighbors,
                      struct vector *learned_neighbors);
+int ne_nl_dump_neigh(uint8_t family, int32_t if_index,
+                    struct vector *neighbors);
+int ne_nl_resolve_neigh(int32_t if_index, const struct in6_addr *addr);
 
 bool ne_is_ovn_owned(const struct ne_nl_received_neigh *nd);
 bool ne_is_valid_remote_vtep(struct ne_nl_received_neigh *ne);

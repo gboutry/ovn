@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <linux/rtnetlink.h>
 #include <sys/resource.h>
+#include <unistd.h>
 
 #include "netlink.h"
 #include "netlink-socket.h"
@@ -232,6 +233,103 @@ test_neighbor_dump_script(struct ovs_cmdl_context *ctx)
     hmap_destroy(&neighbors);
 }
 
+/* Exercises cache information parsing without depending on kernel timing. */
+static void
+test_neighbor_parse(struct ovs_cmdl_context *ctx OVS_UNUSED)
+{
+    struct ofpbuf request;
+    ofpbuf_init(&request, 128);
+    nl_msg_put_nlmsghdr(&request, 0, RTM_NEWNEIGH, 0);
+    struct ndmsg *nd = ofpbuf_put_zeros(&request, sizeof *nd);
+    nd->ndm_family = AF_INET;
+    nd->ndm_ifindex = 42;
+    nd->ndm_state = NUD_REACHABLE;
+    ovs_be32 ip = htonl(0xc0000201);
+    nl_msg_put_be32(&request, NDA_DST, ip);
+
+    struct ne_table_msg msg;
+    ovs_assert(ne_table_parse(&request, &msg) == RTNLGRP_NEIGH);
+    ovs_assert(!msg.nd.has_cacheinfo);
+    ovs_assert(msg.nd.if_index == 42);
+    ovs_assert(in6_addr_get_mapped_ipv4(&msg.nd.addr) == ip);
+
+    long ticks_per_second = sysconf(_SC_CLK_TCK);
+    ovs_assert(ticks_per_second > 0);
+    struct nda_cacheinfo ci = {
+        .ndm_confirmed = 2 * ticks_per_second,
+    };
+    nl_msg_put_unspec(&request, NDA_CACHEINFO, &ci, sizeof ci);
+    ovs_assert(ne_table_parse(&request, &msg) == RTNLGRP_NEIGH);
+    ovs_assert(msg.nd.has_cacheinfo);
+    ovs_assert(msg.nd.confirmed_msec == 2000);
+
+    /* Do not truncate the 32-bit tick count before converting to msec. */
+    ofpbuf_clear(&request);
+    nl_msg_put_nlmsghdr(&request, 0, RTM_NEWNEIGH, 0);
+    nd = ofpbuf_put_zeros(&request, sizeof *nd);
+    nd->ndm_family = AF_INET6;
+    ci.ndm_confirmed = UINT32_MAX;
+    nl_msg_put_unspec(&request, NDA_CACHEINFO, &ci, sizeof ci);
+    ovs_assert(ne_table_parse(&request, &msg) == RTNLGRP_NEIGH);
+    ovs_assert(msg.nd.confirmed_msec ==
+               (uint64_t) UINT32_MAX * 1000 / ticks_per_second);
+
+    /* A short cache-info attribute must not become a confirmation. */
+    ofpbuf_clear(&request);
+    nl_msg_put_nlmsghdr(&request, 0, RTM_NEWNEIGH, 0);
+    nd = ofpbuf_put_zeros(&request, sizeof *nd);
+    nd->ndm_family = AF_INET;
+    nl_msg_put_unspec(&request, NDA_CACHEINFO, &ci, sizeof ci - 1);
+    ovs_assert(!ne_table_parse(&request, &msg));
+    ofpbuf_clear(&request);
+    ovs_assert(!ne_table_parse(&request, &msg));
+    ofpbuf_uninit(&request);
+
+    struct in6_addr addr = in6_addr_mapped_ipv4(ip);
+    ovs_assert(ne_nl_resolve_neigh(0, &addr) == EINVAL);
+    ovs_assert(ne_nl_resolve_neigh(42, &in6addr_any) == EAFNOSUPPORT);
+}
+
+/* Dumps all entries, including ones the EVPN sync considers OVN-owned. */
+static void
+test_neighbor_read(struct ovs_cmdl_context *ctx)
+{
+    unsigned int if_index;
+    if (!test_read_uint_value(ctx, 1, "if_index", &if_index)) {
+        return;
+    }
+
+    struct vector neighbors =
+        VECTOR_EMPTY_INITIALIZER(struct ne_nl_received_neigh);
+    ovs_assert(!ne_nl_dump_neigh(AF_INET, if_index, &neighbors));
+    const struct ne_nl_received_neigh *ne;
+    VECTOR_FOR_EACH_PTR (&neighbors, ne) {
+        char ip[INET6_ADDRSTRLEN];
+        printf("%s "ETH_ADDR_FMT" state=%"PRIu16"\n",
+               ipv6_string_mapped(ip, &ne->addr) ? ip : "(invalid)",
+               ETH_ADDR_ARGS(ne->lladdr), ne->state);
+    }
+    vector_destroy(&neighbors);
+}
+
+static void
+test_neighbor_resolve(struct ovs_cmdl_context *ctx)
+{
+    unsigned int if_index;
+    struct in6_addr addr;
+    if (!test_read_uint_value(ctx, 1, "if_index", &if_index)
+        || !test_read_ipv6_mapped_value(ctx, 2, "IP address", &addr)) {
+        return;
+    }
+
+    int error = ne_nl_resolve_neigh(if_index, &addr);
+    if (error == EEXIST) {
+        printf("exists\n");
+    } else {
+        ovs_assert(!error);
+    }
+}
+
 /* A failed dump must not be reported as successful synchronization. */
 static void
 test_neighbor_sync_error(struct ovs_cmdl_context *ctx OVS_UNUSED)
@@ -383,6 +481,34 @@ test_neighbor_table_notify(struct ovs_cmdl_context *ctx)
                msg->nd.port, msg->nd.nh_id);
     }
 
+    ovn_netlink_notifiers_destroy();
+}
+
+/* Two users of RTNLGRP_NEIGH must not drain or disable one another. */
+static void
+test_neighbor_notifier_fanout(struct ovs_cmdl_context *ctx)
+{
+    ovn_netlink_update_notifier(OVN_NL_NOTIFIER_NEIGHBOR, true);
+    ovn_netlink_update_notifier(OVN_NL_NOTIFIER_ROUTE_NEIGHBOR, true);
+    /* Registering the second notifier drains changes that preceded it. */
+    ovn_netlink_notifier_flush(OVN_NL_NOTIFIER_NEIGHBOR);
+    ovn_netlink_notifier_flush(OVN_NL_NOTIFIER_ROUTE_NEIGHBOR);
+    run_command_under_notifier(ctx->argv[1]);
+
+    struct vector *evpn = ovn_netlink_get_msgs(OVN_NL_NOTIFIER_NEIGHBOR);
+    struct vector *route =
+        ovn_netlink_get_msgs(OVN_NL_NOTIFIER_ROUTE_NEIGHBOR);
+    ovs_assert(evpn->len && evpn->len == route->len);
+    ovs_assert(!memcmp(evpn->buffer, route->buffer,
+                       evpn->len * evpn->esize));
+
+    size_t evpn_len = evpn->len;
+    ovn_netlink_notifier_flush(OVN_NL_NOTIFIER_ROUTE_NEIGHBOR);
+    ovs_assert(evpn->len == evpn_len && !route->len);
+    ovn_netlink_update_notifier(OVN_NL_NOTIFIER_NEIGHBOR, false);
+    run_command_under_notifier(ctx->argv[2]);
+    ovs_assert(!evpn->len && route->len);
+    ovs_assert(!ovn_netlink_notifier_lost(OVN_NL_NOTIFIER_ROUTE_NEIGHBOR));
     ovn_netlink_notifiers_destroy();
 }
 
@@ -720,6 +846,11 @@ test_ovn_netlink(int argc, char *argv[])
     static const struct ovs_cmdl_command commands[] = {
         {"neighbor-dump-script", NULL, 1, 1,
          test_neighbor_dump_script, OVS_RO},
+        {"neighbor-parse", NULL, 0, 0, test_neighbor_parse, OVS_RO},
+        {"neighbor-read", NULL, 1, 1, test_neighbor_read, OVS_RO},
+        {"neighbor-resolve", NULL, 2, 2, test_neighbor_resolve, OVS_RO},
+        {"neighbor-notifier-fanout", NULL, 2, 2,
+         test_neighbor_notifier_fanout, OVS_RO},
         {"neighbor-sync-error", NULL, 0, 0, test_neighbor_sync_error, OVS_RO},
         {"neighbor-sync", NULL, 2, INT_MAX, test_neighbor_sync, OVS_RO},
         {"neighbor-table-notify", NULL, 1, 1,

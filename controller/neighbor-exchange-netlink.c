@@ -18,6 +18,7 @@
 #include <stdbool.h>
 #include <linux/if_ether.h>
 #include <linux/rtnetlink.h>
+#include <unistd.h>
 
 #include "hmapx.h"
 #include "lib/netlink.h"
@@ -53,9 +54,6 @@ static int ne_table_dump_one_ifindex(unsigned char address_family,
                                       int32_t if_index,
                                       ne_table_handle_msg_callback *,
                                       void *aux);
-static int ne_nl_dump_neigh(uint8_t family, int32_t if_index,
-                            struct vector *neighbors);
-
 struct ne_msg_handle_data {
     /* Stores 'struct advertise_neighbor_entry'. */
     struct hmapx *neighbors_to_advertise;
@@ -246,7 +244,7 @@ collect_ne_msg(const struct ne_table_msg *msg, void *data)
 
 /* Appends a complete, read-only snapshot of neighbors to 'neighbors'.  On
  * failure, leaves 'neighbors' unchanged and returns an errno value. */
-static int
+int
 ne_nl_dump_neigh(uint8_t family, int32_t if_index, struct vector *neighbors)
 {
     struct vector snapshot =
@@ -260,6 +258,38 @@ ne_nl_dump_neigh(uint8_t family, int32_t if_index, struct vector *neighbors)
         }
     }
     vector_destroy(&snapshot);
+    return error;
+}
+
+/* Asks the kernel to resolve a missing IPv4 neighbor without supplying a MAC.
+ * Exclusive creation prevents this request from changing an existing entry,
+ * including one installed by an administrator after the caller's snapshot.
+ * Returns EEXIST for an existing entry, or another errno on failure. */
+int
+ne_nl_resolve_neigh(int32_t if_index, const struct in6_addr *addr)
+{
+    if (!IN6_IS_ADDR_V4MAPPED(addr)) {
+        return EAFNOSUPPORT;
+    }
+    ovs_be32 ip = in6_addr_get_mapped_ipv4(addr);
+    if (if_index <= 0 || !ip || ip_is_multicast(ip)
+        || ip == OVS_BE32_MAX) {
+        return EINVAL;
+    }
+
+    uint8_t request_stub[NETNL_REQ_BUFFER_SIZE];
+    struct ofpbuf request;
+    ofpbuf_use_stub(&request, request_stub, sizeof request_stub);
+    nl_msg_put_nlmsghdr(&request, 0, RTM_NEWNEIGH,
+                       NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+    struct ndmsg *nd = ofpbuf_put_zeros(&request, sizeof *nd);
+    nd->ndm_family = AF_INET;
+    nd->ndm_ifindex = if_index;
+    nd->ndm_flags = NTF_USE;
+    nl_msg_put_be32(&request, NDA_DST, ip);
+
+    int error = nl_transact(NETLINK_ROUTE, &request, NULL);
+    ofpbuf_uninit(&request);
     return error;
 }
 
@@ -328,6 +358,9 @@ ne_table_parse__(struct ofpbuf *buf, size_t ofs, const struct nlmsghdr *nlmsg,
         [NDA_LLADDR] = { .type = NL_A_LL_ADDR, .optional = true },
         [NDA_PORT] = { .type = NL_A_U16, .optional = true },
         [NDA_NH_ID] = { .type = NL_A_U32, .optional = true },
+        [NDA_CACHEINFO] = { .type = NL_A_UNSPEC, .optional = true,
+                           .min_len = sizeof(struct nda_cacheinfo),
+                           .max_len = sizeof(struct nda_cacheinfo) },
     };
 
     static const struct nl_policy policy6[] = {
@@ -335,6 +368,9 @@ ne_table_parse__(struct ofpbuf *buf, size_t ofs, const struct nlmsghdr *nlmsg,
         [NDA_LLADDR] = { .type = NL_A_LL_ADDR, .optional = true },
         [NDA_PORT] = { .type = NL_A_U16, .optional = true },
         [NDA_NH_ID] = { .type = NL_A_U32, .optional = true },
+        [NDA_CACHEINFO] = { .type = NL_A_UNSPEC, .optional = true,
+                           .min_len = sizeof(struct nda_cacheinfo),
+                           .max_len = sizeof(struct nda_cacheinfo) },
     };
 
     static const struct nl_policy policy_bridge[] = {
@@ -345,6 +381,9 @@ ne_table_parse__(struct ofpbuf *buf, size_t ofs, const struct nlmsghdr *nlmsg,
         [NDA_PORT] = { .type = NL_A_U16, .optional = true },
         [NDA_VLAN] = { .type = NL_A_U16, .optional = true },
         [NDA_NH_ID] = { .type = NL_A_U32, .optional = true },
+        [NDA_CACHEINFO] = { .type = NL_A_UNSPEC, .optional = true,
+                           .min_len = sizeof(struct nda_cacheinfo),
+                           .max_len = sizeof(struct nda_cacheinfo) },
     };
 
     BUILD_ASSERT(ARRAY_SIZE(policy) == ARRAY_SIZE(policy6));
@@ -412,6 +451,17 @@ ne_table_parse__(struct ofpbuf *buf, size_t ofs, const struct nlmsghdr *nlmsg,
 
         if (attrs[NDA_NH_ID]) {
             change->nd.nh_id = nl_attr_get_u32(attrs[NDA_NH_ID]);
+        }
+
+        if (attrs[NDA_CACHEINFO]) {
+            long ticks_per_second = sysconf(_SC_CLK_TCK);
+            if (ticks_per_second > 0) {
+                const struct nda_cacheinfo *ci =
+                    nl_attr_get(attrs[NDA_CACHEINFO]);
+                change->nd.has_cacheinfo = true;
+                change->nd.confirmed_msec =
+                    (uint64_t) ci->ndm_confirmed * 1000 / ticks_per_second;
+            }
         }
     } else {
         VLOG_DBG_RL(&rl, "received unparseable rtnetlink neigh message");
