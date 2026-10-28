@@ -86,6 +86,19 @@ struct route_exchange_ctx_out {
  * them all again. */
 struct route_exchange_state;
 
+/* A resolved kernel next hop on an explicitly mapped logical port.  Strings
+ * point into route data and are valid until that data is recomputed. */
+struct route_next_hop {
+    const char *logical_port;
+    const struct sbrec_datapath_binding *datapath;
+    struct in6_addr addr;
+    char ifname[IFNAMSIZ + 1];
+};
+
+bool route_exchange_get_next_hops(const struct route_exchange_state *,
+                                 const struct hmap *announce_routes,
+                                 struct vector *next_hops);
+
 struct route_exchange_state *route_exchange_state_create(void);
 void route_exchange_state_destroy(struct route_exchange_state *);
 

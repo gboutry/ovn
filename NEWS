@@ -1,5 +1,9 @@
 Post v26.09.0
 --------------
+   - Dynamic routing: resolve IPv4 next-hop neighbors on explicitly mapped
+     addressless router ports using the host uplink identity and Linux
+     neighbor cache. Learn route-scoped next-hop GARP announcements outside
+     the router port's configured subnet coverage.
    - Learn ARP sender hardware address (arp.sha) and IPv6 Neighbor
      Discovery link-layer addresses (nd.tll, nd.sll) into the FDB
      table in addition to eth.src.  This allows VRRP virtual MACs to

@@ -28,6 +28,7 @@
 #include "local_data.h"
 #include "lport.h"
 #include "mac-cache.h"
+#include "route-neighbor.h"
 #include "nx-match.h"
 #include "ofctrl.h"
 #include "lib/ofctrl-seqno.h"
@@ -197,6 +198,7 @@ static struct pinctrl pinctrl;
 static bool pinctrl_is_sb_commited(int64_t commit_cfg, int64_t cur_cfg);
 static void init_buffered_packets_map(void);
 static void destroy_buffered_packets_map(void);
+
 static void
 run_buffered_binding(const struct sbrec_mac_binding_table *mac_binding_table,
                      const struct hmap *local_datapaths,
@@ -214,7 +216,10 @@ static void run_put_mac_bindings(
     struct ovsdb_idl_txn *ovnsb_idl_txn,
     struct ovsdb_idl_index *sbrec_datapath_binding_by_key,
     struct ovsdb_idl_index *sbrec_port_binding_by_key,
-    struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip);
+    struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
+    struct ovsdb_idl_index *sbrec_port_binding_by_name,
+    const struct sbrec_chassis *chassis,
+    struct route_neighbor_state *route_neighbors);
 static void wait_put_mac_bindings(void);
 static void send_mac_binding_buffered_pkts(struct rconn *swconn);
 
@@ -392,6 +397,8 @@ static void pinctrl_handle_put_fdb(const struct flow *md,
 static void set_from_ctrl_flag_in_pkt_metadata(struct ofputil_packet_in *);
 
 COVERAGE_DEFINE(pinctrl_drop_put_mac_binding);
+COVERAGE_DEFINE(pinctrl_expired_put_mac_binding);
+COVERAGE_DEFINE(pinctrl_received_put_mac_binding);
 COVERAGE_DEFINE(pinctrl_ring_full_put_mac_binding);
 COVERAGE_DEFINE(pinctrl_drop_put_fdb);
 COVERAGE_DEFINE(pinctrl_ring_full_put_fdb);
@@ -4220,7 +4227,8 @@ pinctrl_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
             const struct shash *local_active_ports_ipv6_pd,
             const struct shash *local_active_ports_ras,
             const struct ovsrec_open_vswitch_table *ovs_table,
-            int64_t cur_cfg)
+            int64_t cur_cfg,
+            struct route_neighbor_state *route_neighbors)
 {
     ovs_mutex_lock(&pinctrl_mutex);
 
@@ -4255,7 +4263,8 @@ pinctrl_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
                          sbrec_mac_binding_by_lport_ip);
     run_put_mac_bindings(ovnsb_idl_txn, sbrec_datapath_binding_by_key,
                          sbrec_port_binding_by_key,
-                         sbrec_mac_binding_by_lport_ip);
+                         sbrec_mac_binding_by_lport_ip,
+                         sbrec_port_binding_by_name, chassis, route_neighbors);
     run_put_fdbs(ovnsb_idl_txn, sbrec_port_binding_by_key,
                  sbrec_datapath_binding_by_key, sbrec_fdb_by_dp_key_mac,
                  cur_cfg);
@@ -4823,6 +4832,7 @@ pinctrl_destroy(void)
 /* Buffered "put_mac_binding" operation. */
 
 #define MAX_MAC_BINDING_DELAY_MSEC 50
+#define MAX_MAC_BINDING_AGE_MSEC   1000
 #define MAX_FDB_DELAY_MSEC         50
 #define MAX_MAC_BINDINGS           1024
 #define MAC_BINDINGS_MC_COOKIE     0xff
@@ -4864,6 +4874,7 @@ pinctrl_handle_put_mac_binding(const struct flow *md,
             .dp_key =  ntohll(md->metadata),
             .port_key =  md->regs[MFF_LOG_INPORT - MFF_REG0],
             .mac = headers->dl_src,
+            .observed_msec = time_msec(),
     };
 
     if (is_arp) {
@@ -4878,6 +4889,7 @@ pinctrl_handle_put_mac_binding(const struct flow *md,
          * every iteration. */
         COVERAGE_INC(pinctrl_ring_full_put_mac_binding);
     } else {
+        COVERAGE_INC(pinctrl_received_put_mac_binding);
         notify_pinctrl_main();
     }
 }
@@ -4907,7 +4919,10 @@ run_put_mac_binding(struct ovsdb_idl_txn *ovnsb_idl_txn,
                     struct ovsdb_idl_index *sbrec_datapath_binding_by_key,
                     struct ovsdb_idl_index *sbrec_port_binding_by_key,
                     struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
-                    const struct mac_binding *mb)
+                    const struct mac_binding *mb,
+                    struct ovsdb_idl_index *sbrec_port_binding_by_name,
+                    const struct sbrec_chassis *chassis,
+                    struct route_neighbor_state *route_neighbors)
 {
     /* Convert logical datapath and logical port key into lport. */
     const struct sbrec_port_binding *pb = lport_lookup_by_key(
@@ -4919,6 +4934,47 @@ run_put_mac_binding(struct ovsdb_idl_txn *ovnsb_idl_txn,
         VLOG_WARN_RL(&rl, "unknown logical port with datapath %"PRIu32" "
                      "and port %"PRIu32, mb->data.dp_key, mb->data.port_key);
         return;
+    }
+
+    if (route_neighbor_observe(route_neighbors, pb, &mb->data.ip,
+                               mb->data.mac, mb->data.observed_msec)) {
+        return;
+    }
+
+    /* A buffered observation can outlive the chassis that received it.
+     * Explicitly mapped addressless router uplinks with chassis ownership
+     * must still be owned by this chassis when the observation is written,
+     * including after the resolver has discarded its former scope. */
+    const struct sbrec_port_binding *cr =
+        lport_get_cr_port(sbrec_port_binding_by_name, pb, NULL);
+    const char *port_name =
+        smap_get(&pb->options, "dynamic-routing-port-name");
+    if (!port_name && cr) {
+        port_name = smap_get(&cr->options, "dynamic-routing-port-name");
+    }
+    bool chassis_bound = cr || pb->chassis || !strcmp(pb->type, "l3gateway");
+    if (IN6_IS_ADDR_V4MAPPED(&mb->data.ip) && chassis_bound &&
+        port_name && port_name[0] &&
+        smap_get(&pb->datapath->external_ids, "logical-router") && pb->n_mac) {
+        struct lport_addresses addresses;
+        if (!extract_lsp_addresses(pb->mac[0], &addresses)) {
+            return;
+        }
+        bool addressless = !addresses.n_ipv4_addrs;
+        destroy_lport_addresses(&addresses);
+        if (addressless) {
+            const struct sbrec_port_binding *owner = cr ? cr : pb;
+            if (!owner->chassis || owner->chassis != chassis) {
+                return;
+            }
+            sbrec_port_binding_verify_chassis(owner);
+            if (owner != pb) {
+                sbrec_port_binding_verify_options(owner);
+            }
+            sbrec_port_binding_verify_options(pb);
+            sbrec_port_binding_verify_mac(pb);
+            sbrec_port_binding_verify_datapath(pb);
+        }
     }
 
     /* Convert ethernet argument to string form for database. */
@@ -4940,12 +4996,19 @@ static void
 run_put_mac_bindings(struct ovsdb_idl_txn *ovnsb_idl_txn,
                      struct ovsdb_idl_index *sbrec_datapath_binding_by_key,
                      struct ovsdb_idl_index *sbrec_port_binding_by_key,
-                     struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip)
+                     struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
+                     struct ovsdb_idl_index *sbrec_port_binding_by_name,
+                     const struct sbrec_chassis *chassis,
+                     struct route_neighbor_state *route_neighbors)
 {
     long long now = time_msec();
 
     struct mac_binding_data mb_data;
     SPSC_RING_FOR_EACH_POP (&mac_bindings_ring, mb_data) {
+        if (now - mb_data.observed_msec > MAX_MAC_BINDING_AGE_MSEC) {
+            COVERAGE_INC(pinctrl_expired_put_mac_binding);
+            continue;
+        }
         if (hmap_count(&put_mac_bindings) >= MAX_MAC_BINDINGS) {
             COVERAGE_INC(pinctrl_drop_put_mac_binding);
             continue;
@@ -4963,21 +5026,44 @@ run_put_mac_bindings(struct ovsdb_idl_txn *ovnsb_idl_txn,
         mac_binding_add(&put_mac_bindings, mb_data, NULL, now + delay);
     }
 
-    if (!ovnsb_idl_txn) {
-        return;
-    }
-
     struct mac_binding *mb;
     HMAP_FOR_EACH_SAFE (mb, hmap_node, &put_mac_bindings) {
-        if (now >= mb->timestamp) {
+        if (now - mb->data.observed_msec > MAX_MAC_BINDING_AGE_MSEC) {
+            COVERAGE_INC(pinctrl_expired_put_mac_binding);
+            mac_binding_remove(&put_mac_bindings, mb);
+            continue;
+        }
+        if (ovnsb_idl_txn && now >= mb->timestamp) {
             run_put_mac_binding(ovnsb_idl_txn,
                                 sbrec_datapath_binding_by_key,
                                 sbrec_port_binding_by_key,
-                                sbrec_mac_binding_by_lport_ip, mb);
+                                sbrec_mac_binding_by_lport_ip, mb,
+                                sbrec_port_binding_by_name, chassis,
+                                route_neighbors);
             mac_binding_remove(&put_mac_bindings, mb);
         }
     }
 }
+
+/* Drain and expire packet observations even when the main loop has no usable
+ * SB snapshot.  This is main-thread-only maintenance and performs no database
+ * writes or lookups. */
+void
+pinctrl_maintenance(void)
+{
+    uint64_t observed_seq = seq_read(pinctrl_main_seq);
+    run_put_mac_bindings(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+
+    /* New packet observations must wake maintenance while SB is unavailable,
+     * when the transaction-dependent pinctrl wait path is inactive. */
+    seq_wait(pinctrl_main_seq, observed_seq);
+    struct mac_binding *mb;
+    HMAP_FOR_EACH (mb, hmap_node, &put_mac_bindings) {
+        poll_timer_wait_until(mb->data.observed_msec +
+                              MAX_MAC_BINDING_AGE_MSEC + 1);
+    }
+}
+
 
 static void
 run_buffered_binding(const struct sbrec_mac_binding_table *mac_binding_table,

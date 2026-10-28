@@ -297,7 +297,19 @@ tests_ovstest_LDFLAGS = $(AM_LDFLAGS) \
 	-Wl,--wrap=nl_dump_start \
 	-Wl,--wrap=nl_dump_next \
 	-Wl,--wrap=nl_dump_done \
-	-Wl,--wrap=nl_transact
+	-Wl,--wrap=nl_transact \
+	-Wl,--wrap=time_msec \
+	-Wl,--wrap=lport_lookup_by_name \
+	-Wl,--wrap=netdev_open \
+	-Wl,--wrap=netdev_close \
+	-Wl,--wrap=netdev_get_flags \
+	-Wl,--wrap=netdev_get_etheraddr \
+	-Wl,--wrap=netdev_get_addr_list \
+	-Wl,--wrap=netdev_get_ifindex \
+	-Wl,--wrap=netdev_get_addrs_list_flush \
+	-Wl,--wrap=ne_nl_dump_neigh \
+	-Wl,--wrap=ne_nl_resolve_neigh \
+	-Wl,--wrap=ovn_netlink_update_notifier
 
 tests_ovstest_SOURCES += \
 	controller/host-if-monitor.c \
@@ -312,7 +324,10 @@ tests_ovstest_SOURCES += \
 	controller/ovn-netlink-notifier.h \
 	controller/route-exchange-netlink.c \
 	controller/route-exchange-netlink.h \
-	tests/test-ovn-netlink.c
+	controller/route-neighbor.c \
+	controller/route-neighbor.h \
+	tests/test-ovn-netlink.c \
+	tests/test-route-neighbor.c
 endif
 
 tests_ovstest_LDADD = $(OVS_LIBDIR)/daemon.lo \

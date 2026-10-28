@@ -18,10 +18,11 @@ Next-hop MAC resolution implementation plan
 Status and intended behavior
 ----------------------------
 
-This is a proposed implementation, based on main commit
-``1c8d7419a73743f79ff54102c6b66f6c8061b756``. It does not describe an
-implemented or tested feature. It supersedes the proposed Neutron-side
-static-MAC reconciler as the preferred development direction.
+This records the design for the implementation based on main commit
+``1c8d7419a73743f79ff54102c6b66f6c8061b756``. The neighbor-resolution and
+MAC-binding changes remain entirely inside OVN. The operational behavior
+is documented in :doc:`architecture`; the test matrix below describes
+acceptance goals, rather than a claim that every scenario has been run.
 
 Keep resolution inside OVN. ``ovn-northd`` will learn valid announcements
 for route next hops outside an LRP's subnet coverage. ``ovn-controller``
@@ -30,11 +31,10 @@ Linux neighbor subsystem and publish ordinary SB ``MAC_Binding`` records.
 This supplies both initial resolution and continued refresh, including
 fabrics that do not answer OVN's zero-source ARP probes as expected.
 
-The routing daemon remains external. In the intended deployment MicroOVN
-manages BIRD, the host networking owner provisions numbered interfaces and
-adjacent-peer reachability, and Neutron retains its generated topology.
-Neither Neutron nor MicroOVN needs a neighbor reconciler, additional NB
-write access, or an authoritative ``Static_MAC_Binding`` journal.
+The routing daemon remains external. The host networking owner provisions
+numbered interfaces and adjacent-peer reachability; OVN retains its logical
+topology. No external neighbor reconciler, additional NB write access, or
+authoritative ``Static_MAC_Binding`` journal is needed.
 
 The algorithm uses interface identity and resolved next hops, not a special
 case for an uplink prefix length. A host-route peer still needs explicit
@@ -44,8 +44,9 @@ ordinary connected route. Both endpoints must support the chosen numbering.
 Implementation boundaries
 -------------------------
 
-* Do not number Neutron's fabric LRP, borrow the host IP under a different
-  LRP MAC, allocate another underlay IP, or rewrite incoming ARP opcodes.
+* Do not number an addressless fabric LRP, borrow the host IP under a
+  different LRP MAC, allocate another underlay IP, or rewrite incoming ARP
+  opcodes.
 * Do not add an OVN routing daemon, external command dependency, background
   thread, NB journal, or schema column. Use the existing controller engine,
   poll loop, netlink utilities, IDL transactions and dynamic-MAC pipeline.
@@ -444,10 +445,10 @@ available GCC/Clang and memory-check targets as documented for the change.
 Kernel and userspace system suites must run serially in an isolated test
 environment, not against an unrelated host OVS instance.
 
-Native route-import tests do not establish BIRD integration. Final live
-acceptance must use actual BIRD-generated routes with the proper protocol
-marker, unchanged Neutron topology and the intended fabric. Capture host ARP
-source identity, Linux neighbor states, SB learned routes/MAC bindings,
+Native route-import tests do not establish routing-daemon integration. Final
+live acceptance must use actual dynamically learned routes with the proper
+protocol marker, unchanged OVN topology and the intended fabric. Capture host
+ARP source identity, Linux neighbor states, SB learned routes/MAC bindings,
 installed flows and bidirectional VM/FIP traffic. Include cold start,
 withdrawal, silent MAC change, aging, restart and dual-uplink loss/recovery.
 Report versions, counts, skips, measured convergence and untested boundaries.
@@ -493,17 +494,17 @@ of preparing this plan.
 Current verification boundary
 -----------------------------
 
-The inspected checkout has no generated Makefile or configured build, and
-its pinned OVS submodule is uninitialized. Runtime tests have not been run
-for this plan, and no runtime implementation is included. A documentation
-build cannot prove kernel solicitation, MAC convergence or traffic delivery.
-Record documentation checks separately from the native and live acceptance
-results when implementing the series.
+Build and test results belong to the particular revision being reviewed.
+A documentation build cannot prove kernel solicitation, MAC convergence or
+traffic delivery. Record documentation checks, native test counts and live
+acceptance results separately, including skipped or untested scenarios.
+In particular, native kernel route injection does not establish routing
+daemon interoperability or physical fabric traffic delivery.
 
 References
 ----------
 
-* `LP #2165017 <https://bugs.launchpad.net/neutron/+bug/2165017>`_.
+* `LP #2165017 <https://bugs.launchpad.net/bugs/2165017>`_.
 * https://mail.openvswitch.org/pipermail/ovs-discuss/2026-September/054016.html
 * `Linux v6.8 neighbor use handling
   <https://github.com/torvalds/linux/blob/v6.8/net/core/neighbour.c>`_.

@@ -740,3 +740,46 @@ tunnels.  The format supports per-VNI IP assignment:
 
 If no VNI-specific address is provided, the default IP address is used
 for all VNIs.
+
+IPv4 Next-hop Resolution on Unnumbered Ports
+---------------------------------------------
+
+An IPv4-addressless logical router port can learn routes through a numbered
+Linux uplink. For a port with an explicit ``dynamic-routing-port-name`` and
+a local interface mapping, the active chassis resolves the accepted IPv4
+next hops through the Linux neighbor cache. The host interface must have an
+IPv4 address and direct reachability to the adjacent peer. The interface's
+prefix length does not select a different resolution algorithm.
+
+``ovn-controller`` publishes confirmed neighbors as ordinary Southbound
+``MAC_Binding`` entries. It requests initial kernel resolution without
+supplying a MAC address. For existing dynamic neighbors, it sends ARP
+requests using the host interface's actual IP and MAC without replacing
+administrative neighbor state. This does not assign an address to the
+logical router port or require another underlay address.
+
+Neighbor solicitation requires the controller's existing kernel networking
+access and permission to transmit raw Ethernet packets. No permission or
+service configuration is changed automatically. Failed kernel operations
+are retried without claiming successful resolution.
+
+Announcements for a route's exact next hop are also eligible for native
+learning outside the output port's configured IPv4 subnet coverage. The
+``always_learn_from_arp_request`` router option retains its existing meaning.
+For next hops managed through Linux, packet observations instead request
+revalidation, so delayed packet learning cannot become a competing binding
+writer. Operator static-MAC binding precedence is unchanged.
+
+Only the active chassis may publish a shared port's next-hop binding. HA
+standby membership alone does not grant publication authority. Route and
+neighbor events trigger repair, with periodic scans covering missed events
+and interfaces whose host address appears after the route. A cached stale
+neighbor or traffic statistics alone do not renew reachability timestamps.
+
+Withdrawing the last route reference removes unchanged runtime-owned state
+while local ownership still holds. On ownership loss the previous chassis
+stops publishing or deleting shared state. After restart, current route
+references are reconstructed; residual unreferenced dynamic cache entries
+follow normal aging and port/datapath cleanup. Neighbor failure is not a
+replacement for BGP/BFD route withdrawal, and database outages can delay
+forwarding convergence.

@@ -66,6 +66,7 @@ controller_ovn_controller_SOURCES = \
 	controller/ecmp-next-hop-monitor.h \
 	controller/ecmp-next-hop-monitor.c \
 	controller/route-exchange.h \
+	controller/route-neighbor.h \
 	controller/route.h \
 	controller/route.c \
 	controller/garp_rarp.h \
@@ -84,14 +85,16 @@ controller_ovn_controller_SOURCES += \
 	controller/nexthop-exchange.c \
 	controller/route-exchange-netlink.h \
 	controller/route-exchange-netlink.c \
-	controller/route-exchange.c
+	controller/route-exchange.c \
+	controller/route-neighbor.c
 else
 controller_ovn_controller_SOURCES += \
 	controller/host-if-monitor-stub.c \
 	controller/ovn-netlink-notifier-stub.c \
 	controller/neighbor-exchange-stub.c \
 	controller/nexthop-exchange-stub.c \
-	controller/route-exchange-stub.c
+	controller/route-exchange-stub.c \
+	controller/route-neighbor-stub.c
 endif
 
 controller_ovn_controller_LDADD = lib/libovn.la $(OVS_LIBDIR)/libopenvswitch.la

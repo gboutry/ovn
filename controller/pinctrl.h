@@ -23,6 +23,7 @@
 #include "openvswitch/list.h"
 #include "openvswitch/meta-flow.h"
 
+struct route_neighbor_state;
 struct hmap;
 struct shash;
 struct lport_index;
@@ -42,6 +43,7 @@ struct sbrec_port_binding;
 struct sbrec_mac_binding_table;
 
 void pinctrl_init(void);
+void pinctrl_maintenance(void);
 void pinctrl_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
                  struct ovsdb_idl_index *sbrec_datapath_binding_by_key,
                  struct ovsdb_idl_index *sbrec_port_binding_by_key,
@@ -60,7 +62,8 @@ void pinctrl_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
                  const struct shash *local_active_ports_ipv6_pd,
                  const struct shash *local_active_ports_ras,
                  const struct ovsrec_open_vswitch_table *ovs_table,
-                 int64_t cur_cfg);
+                 int64_t cur_cfg,
+                 struct route_neighbor_state *route_neighbors);
 void pinctrl_wait(struct ovsdb_idl_txn *ovnsb_idl_txn);
 void pinctrl_destroy(void);
 void pinctrl_seqno_run(void);

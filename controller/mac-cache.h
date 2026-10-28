@@ -30,6 +30,7 @@
 struct ovsdb_idl_index;
 struct vector;
 struct uuidset;
+struct route_neighbor_state;
 
 struct mac_cache_data {
     /* 'struct mac_cache_threshold' by datapath's tunnel_key. */
@@ -62,6 +63,9 @@ struct mac_binding_data {
     struct in6_addr ip;
     /* Value. */
     struct eth_addr mac;
+    /* Packet observation time for queued put_arp/put_nd operations, or zero
+     * for bindings populated by other sources. */
+    long long observed_msec;
 };
 
 struct mac_binding_probe_data {
@@ -70,6 +74,7 @@ struct mac_binding_probe_data {
     struct rconn *swconn;
     struct ovsdb_idl_index *sbrec_port_binding_by_name;
     const struct sbrec_chassis *chassis;
+    struct route_neighbor_state *route_neighbors;
 };
 
 struct mac_binding {

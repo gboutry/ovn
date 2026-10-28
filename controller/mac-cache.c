@@ -22,6 +22,7 @@
 #include "local_data.h"
 #include "lport.h"
 #include "mac-cache.h"
+#include "route-neighbor.h"
 #include "openvswitch/hmap.h"
 #include "openvswitch/vlog.h"
 #include "ovn/logical-fields.h"
@@ -1023,6 +1024,11 @@ mac_binding_probe_stats_run(struct vector *stats_vec, uint64_t *req_delay,
             mac_binding_update_log("Not sending ARP/ND request for non-local",
                                    &mb->data, true, threshold,
                                    stats->idle_age_ms, since_updated_ms);
+            continue;
+        }
+
+        if (route_neighbor_observe(probe_data->route_neighbors, pb,
+                                   &mb->data.ip, eth_addr_zero, time_msec())) {
             continue;
         }
 

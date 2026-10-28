@@ -47,6 +47,7 @@
 #include "local_data.h"
 #include "lport.h"
 #include "memory.h"
+#include "netdev.h"
 #include "ofctrl.h"
 #include "lib/ofctrl-seqno.h"
 #include "openvswitch/vconn.h"
@@ -87,6 +88,7 @@
 #include "hmapx.h"
 #include "mirror.h"
 #include "mac-cache.h"
+#include "route-neighbor.h"
 #include "statctrl.h"
 #include "lib/dns-resolve.h"
 #include "ct-zone.h"
@@ -5461,6 +5463,13 @@ controller_output_route_exchange_handler(struct engine_node *node OVS_UNUSED,
 }
 
 static enum engine_input_handler_result
+controller_output_route_neighbor_handler(struct engine_node *node OVS_UNUSED,
+                                         void *data OVS_UNUSED)
+{
+    return EN_HANDLED_UPDATED;
+}
+
+static enum engine_input_handler_result
 controller_output_garp_rarp_handler(struct engine_node *node OVS_UNUSED,
                                     void *data OVS_UNUSED)
 {
@@ -6179,6 +6188,128 @@ en_route_exchange_cleanup(void *data)
 {
     struct ed_type_route_exchange *re = data;
     route_exchange_state_destroy(re->state);
+}
+
+struct ed_type_route_neighbor {
+    struct route_neighbor_state *state;
+};
+
+/* Input nodes run before their dependents, so the resolver supplies this
+ * non-owning pointer when it first runs. */
+struct route_neighbor_waker {
+    struct route_neighbor_state *state;
+    bool pending;
+};
+
+static void *
+en_route_neighbor_waker_init(struct engine_node *node OVS_UNUSED,
+                             struct engine_arg *arg OVS_UNUSED)
+{
+    return xzalloc(sizeof (struct route_neighbor_waker));
+}
+
+static enum engine_node_state
+en_route_neighbor_waker_run(struct engine_node *node OVS_UNUSED, void *data)
+{
+    struct route_neighbor_waker *waker = data;
+    /* Deferred work is retried when SB becomes writable.  An expired
+     * resolver timer must not spin the controller while writes are blocked. */
+    if (!engine_get_context()->ovnsb_idl_txn) {
+        if (route_neighbor_wake(waker->state)) {
+            waker->pending = true;
+            /* Recovery reads a complete snapshot; queued events need not
+             * accumulate for the duration of an SB outage. */
+            ovn_netlink_notifier_flush(OVN_NL_NOTIFIER_ROUTE_NEIGHBOR);
+        }
+        return EN_UNCHANGED;
+    }
+    bool wake = waker->pending || route_neighbor_wake(waker->state);
+    route_neighbor_wait(waker->state);
+    return wake ? EN_UPDATED : EN_UNCHANGED;
+}
+
+static void
+en_route_neighbor_waker_cleanup(void *data OVS_UNUSED)
+{
+}
+
+static void *
+en_route_neighbor_init(struct engine_node *node OVS_UNUSED,
+                       struct engine_arg *arg OVS_UNUSED)
+{
+    struct ed_type_route_neighbor *data = xmalloc(sizeof *data);
+    data->state = route_neighbor_create();
+    return data;
+}
+
+static enum engine_node_state
+en_route_neighbor_run(struct engine_node *node, void *data_)
+{
+    struct ed_type_route_neighbor *data = data_;
+    struct route_neighbor_waker *waker =
+        engine_get_input_data("route_neighbor_waker", node);
+    waker->state = data->state;
+    waker->pending = false;
+
+    const struct ovsrec_open_vswitch_table *ovs_table =
+        EN_OVSDB_GET(engine_get_input("OVS_open_vswitch", node));
+    const char *chassis_id = get_ovs_chassis_id(ovs_table);
+    struct ovsdb_idl_index *chassis_by_name = engine_ovsdb_node_get_index(
+        engine_get_input("SB_chassis", node), "name");
+    const struct sbrec_chassis *chassis =
+        chassis_id
+        ? chassis_lookup_by_name(chassis_by_name, chassis_id) : NULL;
+
+    struct ed_type_route_exchange *re =
+        engine_get_input_data("route_exchange", node);
+    struct ed_type_route *route_data = engine_get_input_data("route", node);
+    struct controller_engine_ctx *ctrl_ctx =
+        engine_get_context()->client_ctx;
+    struct vector next_hops = VECTOR_EMPTY_INITIALIZER(struct route_next_hop);
+    bool ready = chassis && ctrl_ctx->sb_all_data_loaded &&
+                 re->initial_routes_loaded;
+    if (ready) {
+        ready = route_exchange_get_next_hops(re->state,
+                                             &route_data->announce_routes,
+                                             &next_hops);
+    }
+
+    struct engine_node *pb_node = engine_get_input("SB_port_binding", node);
+    struct engine_node *mb_node = engine_get_input("SB_mac_binding", node);
+    route_neighbor_run(data->state, engine_get_context()->ovnsb_idl_txn,
+                        &next_hops,
+                        engine_ovsdb_node_get_index(pb_node, "name"),
+                        engine_ovsdb_node_get_index(mb_node, "lport_ip"),
+                        EN_OVSDB_GET(mb_node), chassis,
+                        engine_get_input_data("mac_cache", node), ready);
+    vector_destroy(&next_hops);
+    return EN_UPDATED;
+}
+
+/* Reconciliation consumes complete snapshots.  Incremental inputs can defer
+ * it without canceling unrelated work when SB is temporarily readonly. */
+static enum engine_input_handler_result
+route_neighbor_change_handler(struct engine_node *node, void *data)
+{
+    struct route_neighbor_waker *waker =
+        engine_get_input_data("route_neighbor_waker", node);
+    if (!engine_get_context()->ovnsb_idl_txn) {
+        waker->pending = true;
+        return EN_HANDLED_UNCHANGED;
+    }
+    /* engine_compute() applies each handler's result before the next input.
+     * All changed inputs are already current, so reconcile only once. */
+    if (!engine_node_changed(node)) {
+        en_route_neighbor_run(node, data);
+    }
+    return EN_HANDLED_UPDATED;
+}
+
+static void
+en_route_neighbor_cleanup(void *data_)
+{
+    struct ed_type_route_neighbor *data = data_;
+    route_neighbor_destroy(data->state);
 }
 
 /* The route_table_notify node is an input node, but the watches are
@@ -7639,6 +7770,8 @@ static ENGINE_NODE(acl_id, IS_VALID);
 static ENGINE_NODE(route);
 static ENGINE_NODE(route_table_notify);
 static ENGINE_NODE(route_exchange, SB_WRITE);
+static ENGINE_NODE(route_neighbor_waker);
+static ENGINE_NODE(route_neighbor, SB_WRITE);
 static ENGINE_NODE(route_exchange_status);
 static ENGINE_NODE(garp_rarp, SB_WRITE);
 static ENGINE_NODE(host_if_monitor);
@@ -7654,6 +7787,14 @@ static ENGINE_NODE(evpn_mac_binding_sync_waker);
 static ENGINE_NODE(evpn_mac_binding_sync, SB_WRITE);
 static ENGINE_NODE(datapaths_updated);
 static ENGINE_NODE(sb_cond_seqno);
+
+static struct route_neighbor_state *
+get_route_neighbors(void)
+{
+    struct ed_type_route_neighbor *data =
+        engine_get_internal_data(&en_route_neighbor);
+    return data ? data->state : NULL;
+}
 
 static void
 inc_proc_ovn_controller_init(
@@ -7713,6 +7854,27 @@ inc_proc_ovn_controller_init(
      * conditions change (including the final ack of the scoped
      * Advertised_Route dump). */
     engine_add_input(&en_route_exchange, &en_sb_cond_seqno, NULL);
+
+    engine_add_input(&en_route_neighbor, &en_route_neighbor_waker,
+                     route_neighbor_change_handler);
+    engine_add_input(&en_route_neighbor, &en_route_exchange,
+                     route_neighbor_change_handler);
+    engine_add_input(&en_route_neighbor, &en_route,
+                     route_neighbor_change_handler);
+    engine_add_input(&en_route_neighbor, &en_sb_port_binding,
+                     route_neighbor_change_handler);
+    engine_add_input(&en_route_neighbor, &en_sb_mac_binding,
+                     route_neighbor_change_handler);
+    engine_add_input(&en_route_neighbor, &en_sb_chassis,
+                     route_neighbor_change_handler);
+    engine_add_input(&en_route_neighbor, &en_ovs_open_vswitch,
+                     route_neighbor_change_handler);
+    engine_add_input(&en_route_neighbor, &en_mac_cache,
+                     route_neighbor_change_handler);
+    engine_add_input(&en_route_neighbor, &en_sb_ro,
+                     route_neighbor_change_handler);
+    engine_add_input(&en_route_neighbor, &en_sb_cond_seqno,
+                     route_neighbor_change_handler);
 
     engine_add_input(&en_addr_sets, &en_sb_address_set,
                      addr_sets_sb_address_set_handler);
@@ -7986,6 +8148,8 @@ inc_proc_ovn_controller_init(
                      controller_output_bfd_chassis_handler);
     engine_add_input(&en_controller_output, &en_route_exchange,
                      controller_output_route_exchange_handler);
+    engine_add_input(&en_controller_output, &en_route_neighbor,
+                     controller_output_route_neighbor_handler);
     engine_add_input(&en_controller_output, &en_garp_rarp,
                      controller_output_garp_rarp_handler);
     engine_add_input(&en_controller_output, &en_evpn_mac_binding_sync,
@@ -8514,6 +8678,10 @@ main(int argc, char *argv[])
     while (!exit_args.exiting) {
         ovsrcu_quiesce_end();
 
+        /* Process provider notifications before reading cached host
+         * interface addresses and link state. */
+        netdev_run();
+        pinctrl_maintenance();
         memory_run();
         if (memory_should_report()) {
             struct simap usage = SIMAP_INITIALIZER(&usage);
@@ -8898,7 +9066,8 @@ main(int argc, char *argv[])
                                     &runtime_data->local_active_ports_ras,
                                     ovsrec_open_vswitch_table_get(
                                             ovs_idl_loop.idl),
-                                    ovnsb_idl_loop.cur_cfg);
+                                    ovnsb_idl_loop.cur_cfg,
+                                    get_route_neighbors());
                         stopwatch_stop(PINCTRL_RUN_STOPWATCH_NAME,
                                        time_msec());
                         mirror_run(ovs_idl_txn,
@@ -8962,7 +9131,8 @@ main(int argc, char *argv[])
                     mac_cache_data = engine_get_data(&en_mac_cache);
                     if (mac_cache_data) {
                         statctrl_run(ovnsb_idl_txn, sbrec_port_binding_by_name,
-                                     chassis, mac_cache_data);
+                                     chassis, mac_cache_data,
+                                     get_route_neighbors());
                     }
 
                     /* Wait for patch ports to be installed and synced before
@@ -9159,6 +9329,7 @@ main(int argc, char *argv[])
         lflow_cache_wait(ctrl_engine_ctx.lflow_cache);
 
 loop_done:
+        netdev_wait();
         memory_wait();
         ovsrcu_quiesce_start();
         poll_block();

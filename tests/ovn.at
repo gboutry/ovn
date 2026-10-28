@@ -48785,3 +48785,90 @@ AT_CHECK([ovs-ofctl dump-flows br-int table=OFTABLE_PHY_TO_LOG \
 OVN_CLEANUP([hv1])
 AT_CLEANUP
 ])
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([MAC binding learning - expire observations during SB outage])
+AT_KEYWORDS([next-hop-neighbor mac-binding])
+CHECK_SCAPY
+ovn_start
+
+check ovn-nbctl \
+    -- lr-add lr \
+    -- lrp-add lr lrp 00:00:00:00:ff:01 192.0.2.1/24 \
+    -- ls-add ls \
+    -- lsp-add-router-port ls ls-lr lrp \
+    -- lsp-add ls ext \
+    -- lsp-set-addresses ext unknown
+
+net_add n1
+sim_add hv1
+as hv1
+check ovs-vsctl add-br br-phys
+ovn_attach n1 br-phys 192.168.0.1
+check ovs-vsctl add-port br-int ext \
+    -- set Interface ext external_ids:iface-id=ext
+wait_for_ports_up
+check ovn-nbctl --wait=hv sync
+
+dnl Establish that the ordinary, unmanaged packet-learning path works.
+send_garp hv1 ext 1 f0:00:00:00:00:01 ff:ff:ff:ff:ff:ff \
+    192.0.2.98 192.0.2.98
+wait_row_count MAC_Binding 1 logical_port=lrp ip=192.0.2.98 \
+    mac='"f0:00:00:00:00:01"'
+
+AS_BOX([Queue a native observation while SB cannot accept it])
+as hv1
+remote=$(ovs-vsctl get Open_vSwitch . external_ids:ovn-remote)
+received=$(ovn-appctl -t ovn-controller \
+    coverage/read-counter pinctrl_received_put_mac_binding)
+expired=$(ovn-appctl -t ovn-controller \
+    coverage/read-counter pinctrl_expired_put_mac_binding)
+check ovs-vsctl set Open_vSwitch . \
+    external_ids:ovn-remote=unix:$ovs_base/unavailable-sb.sock
+OVS_WAIT_FOR_OUTPUT([ovn-appctl -t ovn-controller connection-status],
+    [0], [not connected
+])
+send_garp hv1 ext 1 f0:00:00:00:00:02 ff:ff:ff:ff:ff:ff \
+    192.0.2.99 192.0.2.99
+OVS_WAIT_UNTIL([test "$(ovn-appctl -t ovn-controller \
+    coverage/read-counter pinctrl_received_put_mac_binding)" -gt "$received"])
+dnl Wait for the actual expiry branch, not an arbitrary settlement delay.
+OVS_WAIT_UNTIL([test "$(ovn-appctl -t ovn-controller \
+    coverage/read-counter pinctrl_expired_put_mac_binding)" -gt "$expired"])
+
+AS_BOX([Reconnect without applying the expired observation])
+check ovs-vsctl set Open_vSwitch . external_ids:ovn-remote="$remote"
+OVS_WAIT_FOR_OUTPUT([ovn-appctl -t ovn-controller connection-status],
+    [0], [connected
+])
+check ovn-nbctl --wait=hv sync
+check_row_count MAC_Binding 0 logical_port=lrp ip=192.0.2.99
+
+dnl A fresh observation must still learn after recovery.  Expiry must not
+dnl permanently disable learning or reject all observations for this key.
+send_garp hv1 ext 1 f0:00:00:00:00:03 ff:ff:ff:ff:ff:ff \
+    192.0.2.99 192.0.2.99
+wait_row_count MAC_Binding 1 logical_port=lrp ip=192.0.2.99 \
+    mac='"f0:00:00:00:00:03"'
+
+OVN_CLEANUP([hv1])
+AT_CLEANUP
+])
+
+AT_SETUP([next-hop neighbor resolver stays idle without eligible routes])
+AT_KEYWORDS([route-neighbor-idle])
+AT_SKIP_IF([test "$(uname -s)" != "Linux"])
+AT_CHECK([ovstest test-route-neighbor idle])
+AT_CLEANUP
+
+AT_SETUP([next-hop neighbor resolver retries unavailable host identity])
+AT_KEYWORDS([route-neighbor-idle])
+AT_SKIP_IF([test "$(uname -s)" != "Linux"])
+AT_CHECK([ovstest test-route-neighbor recovery])
+AT_CLEANUP
+
+AT_SETUP([next-hop neighbor resolver shares snapshots per interface])
+AT_KEYWORDS([route-neighbor-snapshots])
+AT_SKIP_IF([test "$(uname -s)" != "Linux"])
+AT_CHECK([ovstest test-route-neighbor snapshots], [0], [], [ignore])
+AT_CLEANUP

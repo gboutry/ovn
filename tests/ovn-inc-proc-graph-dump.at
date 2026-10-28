@@ -482,6 +482,18 @@ digraph "Incremental-Processing-Engine" {
 	route_exchange_status -> route_exchange [[label=""]];
 	sb_ro -> route_exchange [[label="route_exchange_sb_ro_handler"]];
 	sb_cond_seqno -> route_exchange [[label=""]];
+	route_neighbor_waker [[style=filled, shape=box, fillcolor=white, label="route_neighbor_waker"]];
+	route_neighbor [[style=filled, shape=box, fillcolor=white, label="route_neighbor"]];
+	route_neighbor_waker -> route_neighbor [[label="route_neighbor_change_handler"]];
+	route_exchange -> route_neighbor [[label="route_neighbor_change_handler"]];
+	route -> route_neighbor [[label="route_neighbor_change_handler"]];
+	SB_port_binding -> route_neighbor [[label="route_neighbor_change_handler"]];
+	SB_mac_binding -> route_neighbor [[label="route_neighbor_change_handler"]];
+	SB_chassis -> route_neighbor [[label="route_neighbor_change_handler"]];
+	OVS_open_vswitch -> route_neighbor [[label="route_neighbor_change_handler"]];
+	mac_cache -> route_neighbor [[label="route_neighbor_change_handler"]];
+	sb_ro -> route_neighbor [[label="route_neighbor_change_handler"]];
+	sb_cond_seqno -> route_neighbor [[label="route_neighbor_change_handler"]];
 	garp_rarp [[style=filled, shape=box, fillcolor=white, label="garp_rarp"]];
 	OVS_open_vswitch -> garp_rarp [[label=""]];
 	SB_chassis -> garp_rarp [[label=""]];
@@ -511,6 +523,7 @@ digraph "Incremental-Processing-Engine" {
 	mac_cache -> controller_output [[label="controller_output_mac_cache_handler"]];
 	bfd_chassis -> controller_output [[label="controller_output_bfd_chassis_handler"]];
 	route_exchange -> controller_output [[label="controller_output_route_exchange_handler"]];
+	route_neighbor -> controller_output [[label="controller_output_route_neighbor_handler"]];
 	garp_rarp -> controller_output [[label="controller_output_garp_rarp_handler"]];
 	evpn_mac_binding_sync -> controller_output [[label="controller_output_evpn_mac_binding_sync_handler"]];
 	acl_id -> controller_output [[label="controller_output_acl_id_handler"]];

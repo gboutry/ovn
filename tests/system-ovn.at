@@ -17453,6 +17453,395 @@ AT_CLEANUP
 ])
 
 OVN_FOR_EACH_NORTHD([
+AT_SETUP([dynamic-routing - next-hop neighbor resolution])
+AT_KEYWORDS([dynamic-routing next-hop-neighbor])
+AT_SKIP_IF([test $HAVE_TCPDUMP = no])
+AT_SKIP_IF([test "$HAVE_ARPING" = no])
+
+VRF_RESERVE([1337])
+
+ovn_start
+OVS_TRAFFIC_VSWITCHD_START()
+ADD_BR([br-int])
+ADD_BR([br-uplink])
+ADD_BR([br-other])
+
+check ovs-vsctl \
+    -- set Open_vSwitch . external-ids:system-id=hv1 \
+    -- set Open_vSwitch . \
+        external-ids:ovn-remote=unix:$ovs_base/ovn-sb/ovn-sb.sock \
+    -- set Open_vSwitch . external-ids:ovn-encap-type=geneve \
+    -- set Open_vSwitch . external-ids:ovn-encap-ip=169.0.0.1 \
+    -- set Open_vSwitch . \
+        external-ids:ovn-bridge-mappings=phys:br-uplink \
+    -- set Open_vSwitch . \
+        external-ids:dynamic-routing-port-mapping=fabric=br-uplink \
+    -- set Bridge br-int fail-mode=secure \
+        other-config:disable-in-band=true \
+    -- set Bridge br-uplink other-config:hwaddr=00:00:00:00:10:01
+
+check ovs-ofctl add-flow br-uplink 'priority=0,actions=normal'
+dnl Model a fabric that does not accept zero-source ARP probes.
+check ovs-ofctl add-flow br-uplink \
+    'priority=200,arp,arp_spa=0.0.0.0 actions=drop'
+dnl The host and the logical router have distinct MAC addresses. Steer
+dnl workload return traffic to the fabric LRP, as the BGP agent bridge does.
+check ovs-ofctl add-flow br-uplink \
+    'priority=100,ip,nw_dst=192.168.0.0/24 actions=mod_dl_dst:00:00:00:00:00:03,NORMAL'
+
+check ip link add vrf-nh type vrf table 1337
+on_exit 'ip link del vrf-nh'
+check ip link set vrf-nh up
+check ip link set br-uplink master vrf-nh
+check ip link set br-uplink up
+check ip link set br-other master vrf-nh
+check ip link set br-other up
+check ip addr add 198.18.0.1/24 dev br-other
+
+start_daemon ovn-controller
+
+check ovn-nbctl \
+    -- lr-add lr \
+    -- set Logical_Router lr options:chassis=hv1 \
+        options:dynamic-routing=true \
+        options:dynamic-routing-vrf-id=1337 \
+        options:mac_binding_age_threshold=5 \
+    -- lrp-add lr lrp-uplink 00:00:00:00:00:03 \
+    -- lrp-set-options lrp-uplink dynamic-routing-port-name=fabric \
+        dynamic-routing-maintain-vrf=false \
+    -- ls-add fabric \
+    -- lsp-add-router-port fabric fabric-lr lrp-uplink \
+    -- lsp-add-localnet-port fabric fabric-localnet phys \
+    -- lrp-add lr lrp-vm 00:00:00:00:01:01 192.168.0.1/24 \
+    -- lrp-set-options lrp-vm dynamic-routing-no-learning=true \
+    -- ls-add tenant \
+    -- lsp-add-router-port tenant tenant-lr lrp-vm \
+    -- lsp-add tenant vm \
+    -- lsp-set-addresses vm '00:00:00:00:01:02 192.168.0.2'
+
+ADD_NAMESPACES(vm, peer)
+ADD_VETH(vm, vm, br-int, "192.168.0.2/24", "00:00:00:00:01:02", \
+         "192.168.0.1")
+ADD_VETH(peer, peer, br-uplink, "192.0.2.1/32", "00:00:00:00:20:01")
+NS_CHECK_EXEC([peer], [ip link set lo up])
+NS_CHECK_EXEC([peer], [ip addr add 203.0.113.1/32 dev lo])
+NS_CHECK_EXEC([peer], [sysctl -qw net.ipv4.conf.peer.arp_notify=0])
+AT_CAPTURE_FILE([next-hop-kernel-state])
+on_exit 'ip -4 addr show > next-hop-kernel-state
+         ip -4 route show table 1337 >> next-hop-kernel-state
+         ip -4 neigh show nud all >> next-hop-kernel-state
+         ip netns exec peer ip -4 route >> next-hop-kernel-state
+         ip netns exec peer ip -4 neigh show >> next-hop-kernel-state
+         ovs-ofctl dump-flows br-uplink >> next-hop-kernel-state'
+check ovn-nbctl --wait=hv sync
+wait_for_ports_up vm
+wait_row_count Port_Binding 1 logical_port=lrp-uplink \
+    'options:dynamic-routing=true'
+lrp=$(fetch_column Port_Binding _uuid logical_port=lrp-uplink)
+
+AS_BOX([A route can arrive before the host uplink is numbered])
+NS_CHECK_EXEC([peer], [ip route add 192.0.2.2/32 dev peer scope link])
+check ip route add 203.0.113.0/24 via 192.0.2.1 dev br-uplink \
+    onlink table 1337 proto bgp
+wait_row_count Learned_Route 1 logical_port=$lrp
+check_row_count MAC_Binding 0 logical_port=lrp-uplink
+check ip addr add 192.0.2.2/30 dev br-uplink
+wait_row_count MAC_Binding 1 logical_port=lrp-uplink ip=192.0.2.1 \
+    mac='"00:00:00:00:20:01"'
+check ip route del 203.0.113.0/24 table 1337
+wait_row_count Learned_Route 0 logical_port=$lrp
+wait_row_count MAC_Binding 0 logical_port=lrp-uplink
+
+dnl The off-prefix /32 needs a host route; the /31 and /30 use their
+dnl connected routes. All three keep the same addressless logical port.
+for numbered in 32 31 30; do
+    case $numbered in
+        32) host_ip=192.0.2.10; peer_ip=192.0.2.1 ;;
+        31) host_ip=192.0.2.10; peer_ip=192.0.2.11 ;;
+        30) host_ip=192.0.2.9; peer_ip=192.0.2.10 ;;
+    esac
+    AS_BOX([Cold next-hop resolution on a /$numbered uplink])
+    check ip addr flush dev br-uplink
+    check ip addr add $host_ip/$numbered dev br-uplink
+    NS_CHECK_EXEC([peer], [ip addr flush dev peer])
+    NS_CHECK_EXEC([peer], [ip addr add $peer_ip/$numbered dev peer])
+    if test $numbered = 32; then
+        check ip route add $peer_ip/32 dev br-uplink scope link \
+            src $host_ip table 1337
+        NS_CHECK_EXEC([peer], [ip route add $host_ip/32 dev peer scope link])
+    fi
+    NS_CHECK_EXEC([peer], [ip route replace 192.168.0.0/24 \
+        via $host_ip dev peer onlink])
+    check ip neigh flush dev br-uplink
+    NS_CHECK_EXEC([peer], [ip neigh flush dev peer])
+    check_row_count MAC_Binding 0 logical_port=lrp-uplink
+
+    capture=nh-$numbered
+    NETNS_START_TCPDUMP([peer], [-nnei peer -c 1 arp and \
+        ether src 00:00:00:00:10:01], [$capture])
+    check ip route add 203.0.113.0/24 via $peer_ip dev br-uplink \
+        onlink table 1337 proto bgp
+    wait_row_count Learned_Route 1 logical_port=$lrp \
+        ip_prefix=203.0.113.0/24 nexthop=$peer_ip
+    wait_row_count MAC_Binding 1 logical_port=lrp-uplink ip=$peer_ip \
+        mac='"00:00:00:00:20:01"'
+    OVS_WAIT_UNTIL([grep -F "Request who-has $peer_ip tell $host_ip" \
+        $capture.tcpdump])
+    OVS_WAIT_UNTIL([ip neigh show dev br-uplink to $peer_ip | \
+        grep -q 'lladdr 00:00:00:00:20:01 REACHABLE'])
+    NS_CHECK_EXEC([vm], [ping -q -c 3 -i 0.3 -w 3 203.0.113.1 | FORMAT_PING],
+        [0], [dnl
+3 packets transmitted, 3 received, 0% packet loss, time 0ms
+])
+
+    dnl An unrelated interface's same-IP neighbor must not replace the MAC.
+    check ip neigh replace $peer_ip lladdr 00:00:00:00:ff:01 \
+        nud permanent dev br-other
+    check ip route add 198.19.0.0/24 via $peer_ip dev br-other \
+        onlink table 1337 proto bgp
+    check ovn-nbctl --wait=hv sync
+    check_row_count Learned_Route 0 ip_prefix=198.19.0.0/24
+    check_column 00:00:00:00:20:01 MAC_Binding mac \
+        logical_port=lrp-uplink ip=$peer_ip
+    check ip route del 198.19.0.0/24 table 1337
+
+    dnl Keep the binding until the last route using its key disappears.
+    check ip route add 203.0.114.0/24 via $peer_ip dev br-uplink \
+        onlink table 1337 proto bgp
+    wait_row_count Learned_Route 2 logical_port=$lrp
+    check ip route del 203.0.113.0/24 table 1337
+    wait_row_count Learned_Route 1 logical_port=$lrp
+    check_row_count MAC_Binding 1 logical_port=lrp-uplink ip=$peer_ip
+    check ip route del 203.0.114.0/24 table 1337
+    wait_row_count Learned_Route 0 logical_port=$lrp
+    wait_row_count MAC_Binding 0 logical_port=lrp-uplink ip=$peer_ip
+
+    if test $numbered = 32; then
+        check ip route del $peer_ip/32 dev br-uplink table 1337
+        NS_CHECK_EXEC([peer], [ip route del $host_ip/32 dev peer])
+    fi
+done
+
+AS_BOX([Silent MAC change and failed-neighbor recovery])
+check ip route add 203.0.113.0/24 via $peer_ip dev br-uplink \
+    onlink table 1337 proto bgp
+wait_row_count MAC_Binding 1 logical_port=lrp-uplink ip=$peer_ip \
+    mac='"00:00:00:00:20:01"'
+NS_CHECK_EXEC([peer], [ip link set dev peer address 00:00:00:00:20:02])
+wait_row_count MAC_Binding 1 logical_port=lrp-uplink ip=$peer_ip \
+    mac='"00:00:00:00:20:02"'
+OVS_WAIT_UNTIL([ip neigh show dev br-uplink to $peer_ip | \
+    grep -q 'lladdr 00:00:00:00:20:02 REACHABLE'])
+
+AS_BOX([Revalidate the active next hop after an SB outage])
+remote=$(ovs-vsctl get Open_vSwitch . external_ids:ovn-remote)
+on_exit 'ovs-vsctl set Open_vSwitch . external_ids:ovn-remote="$remote"'
+check ovs-vsctl set Open_vSwitch . \
+    external_ids:ovn-remote=unix:$ovs_base/unavailable-sb.sock
+OVS_WAIT_FOR_OUTPUT([ovn-appctl -t ovn-controller connection-status],
+    [0], [not connected
+])
+NS_CHECK_EXEC([peer], [ip link set dev peer address 00:00:00:00:20:03])
+check ip neigh flush dev br-uplink
+dnl Exercise Linux ARP on the actual uplink rather than injecting a
+dnl synthetic REACHABLE neighbor into its cache.
+AT_CHECK([ping -q -c 1 -w 2 -I br-uplink $peer_ip], [0], [ignore], [ignore])
+OVS_WAIT_UNTIL([ip neigh show dev br-uplink to $peer_ip | \
+    grep -q 'lladdr 00:00:00:00:20:03 REACHABLE'])
+check_row_count MAC_Binding 0 logical_port=lrp-uplink ip=$peer_ip \
+    mac='"00:00:00:00:20:03"'
+
+dnl Record wakeups as a diagnostic. Other controller work can cause
+dnl immediate polls, so this is not a global no-spin assertion.
+AT_CAPTURE_FILE([next-hop-outage-poll-zero-delta])
+poll_before=$(ovn-appctl -t ovn-controller \
+    coverage/read-counter poll_zero_timeout)
+sleep 2
+poll_after=$(ovn-appctl -t ovn-controller \
+    coverage/read-counter poll_zero_timeout)
+echo "$((poll_after - poll_before))" > next-hop-outage-poll-zero-delta
+check_row_count MAC_Binding 0 logical_port=lrp-uplink ip=$peer_ip \
+    mac='"00:00:00:00:20:03"'
+
+check ovs-vsctl set Open_vSwitch . external_ids:ovn-remote="$remote"
+OVS_WAIT_FOR_OUTPUT([ovn-appctl -t ovn-controller connection-status],
+    [0], [connected
+])
+check ovn-nbctl --wait=hv sync
+wait_row_count MAC_Binding 1 logical_port=lrp-uplink ip=$peer_ip \
+    mac='"00:00:00:00:20:03"'
+check_row_count MAC_Binding 0 logical_port=lrp-uplink ip=$peer_ip \
+    mac='"00:00:00:00:20:02"'
+NS_CHECK_EXEC([vm], [ping -q -c 3 -i 0.3 -w 3 203.0.113.1 | FORMAT_PING],
+    [0], [dnl
+3 packets transmitted, 3 received, 0% packet loss, time 0ms
+])
+NS_CHECK_EXEC([peer], [ip link set dev peer address 00:00:00:00:20:02])
+wait_row_count MAC_Binding 1 logical_port=lrp-uplink ip=$peer_ip \
+    mac='"00:00:00:00:20:02"'
+OVS_WAIT_UNTIL([ip neigh show dev br-uplink to $peer_ip | \
+    grep -q 'lladdr 00:00:00:00:20:02 REACHABLE'])
+
+NS_CHECK_EXEC([peer], [ip link set peer down])
+check ip neigh replace $peer_ip lladdr 00:00:00:00:20:02 \
+    nud failed dev br-uplink
+wait_row_count MAC_Binding 0 logical_port=lrp-uplink ip=$peer_ip
+check_row_count Learned_Route 1 logical_port=$lrp
+NS_CHECK_EXEC([peer], [ip link set peer up])
+wait_row_count MAC_Binding 1 logical_port=lrp-uplink ip=$peer_ip \
+    mac='"00:00:00:00:20:02"'
+check ip link set br-uplink down
+wait_row_count MAC_Binding 0 logical_port=lrp-uplink ip=$peer_ip
+check ip link set br-uplink up
+check ip route replace 203.0.113.0/24 via $peer_ip dev br-uplink \
+    onlink table 1337 proto bgp
+wait_row_count MAC_Binding 1 logical_port=lrp-uplink ip=$peer_ip \
+    mac='"00:00:00:00:20:02"'
+
+AS_BOX([Administrative neighbors survive restart and route removal])
+check ip neigh replace $peer_ip lladdr 00:00:00:00:20:02 \
+    nud permanent dev br-uplink
+OVS_APP_EXIT_AND_WAIT([ovn-controller])
+start_daemon ovn-controller
+check ovn-nbctl --wait=hv sync
+wait_row_count Learned_Route 1 logical_port=$lrp
+wait_row_count MAC_Binding 1 logical_port=lrp-uplink ip=$peer_ip \
+    mac='"00:00:00:00:20:02"'
+AT_CHECK([ip neigh show dev br-uplink to $peer_ip | \
+    grep -c 'lladdr 00:00:00:00:20:02 PERMANENT'], [0], [1
+])
+
+AS_BOX([A confirmed current scope repairs an obsolete datapath])
+binding=$(fetch_column MAC_Binding _uuid logical_port=lrp-uplink ip=$peer_ip)
+router_dp=$(fetch_column Port_Binding datapath logical_port=lrp-uplink)
+other_dp=$(fetch_column Port_Binding datapath logical_port=vm)
+controller_pid=$(cat ovn-controller.pid)
+check kill -STOP $controller_pid
+on_exit "kill -CONT $controller_pid 2>/dev/null || :"
+check ovn-sbctl set MAC_Binding $binding datapath=$other_dp
+check kill -CONT $controller_pid
+wait_row_count MAC_Binding 1 datapath=$router_dp \
+    logical_port=lrp-uplink ip=$peer_ip mac='"00:00:00:00:20:02"'
+check_column "$binding" MAC_Binding _uuid \
+    logical_port=lrp-uplink ip=$peer_ip
+check ovn-nbctl --wait=hv sync
+
+AS_BOX([Retry a rejected withdrawal transaction without losing ownership])
+dnl A read-only listener rejects real transactions while still delivering
+dnl the complete SB snapshot.  Keep the controller process and its recorded
+dnl binding identity alive; a restart would hide lost cleanup intent.
+check ovn-nbctl --wait=hv set Logical_Router lr \
+    options:mac_binding_age_threshold=0
+check as ovn-sb ovs-appctl -t ovsdb-server ovsdb-server/add-remote \
+    db:OVN_Southbound,SB_Global,connections
+readonly_target=punix:$ovs_base/ovn-sb/cleanup-retry.sock
+AT_CHECK([ovn-sbctl --id=@c create Connection target="\"$readonly_target\"" \
+    read_only=true -- add SB_Global . connections @c], [0], [ignore])
+readonly_connection=$(fetch_column Connection _uuid target="\"$readonly_target\"")
+binding=$(fetch_column MAC_Binding _uuid logical_port=lrp-uplink ip=$peer_ip)
+check_row_count MAC_Binding 1 logical_port=lrp-uplink ip=$peer_ip \
+    mac='"00:00:00:00:20:02"'
+AT_CAPTURE_FILE([cleanup-retry-sb.log])
+retry_log_start=$(wc -l < "$ovs_base/ovn-sb/ovsdb-server.log")
+check kill -STOP $controller_pid
+check ovs-vsctl set Open_vSwitch . \
+    external_ids:ovn-remote=unix:$ovs_base/ovn-sb/cleanup-retry.sock
+check ip route del 203.0.113.0/24 table 1337
+check kill -CONT $controller_pid
+wait_row_count Connection 1 target="\"$readonly_target\"" is_connected=true
+OVS_WAIT_UNTIL([
+    tail -n +$((retry_log_start + 1)) \
+        "$ovs_base/ovn-sb/ovsdb-server.log" > cleanup-retry-sb.log
+    grep -q '"op":"delete","table":"MAC_Binding"' cleanup-retry-sb.log &&
+    grep -q 'delete operation not allowed when database server is in read only mode' \
+        cleanup-retry-sb.log
+])
+dnl The failed transaction must leave exactly the recorded row intact.
+check_column "$binding" MAC_Binding _uuid \
+    logical_port=lrp-uplink ip=$peer_ip
+check_row_count MAC_Binding 1 logical_port=lrp-uplink ip=$peer_ip \
+    mac='"00:00:00:00:20:02"'
+check ovs-vsctl set Open_vSwitch . external_ids:ovn-remote="$remote"
+OVS_WAIT_FOR_OUTPUT([ovn-appctl -t ovn-controller connection-status],
+    [0], [connected
+])
+wait_row_count Learned_Route 0 logical_port=$lrp
+wait_row_count MAC_Binding 0 logical_port=lrp-uplink ip=$peer_ip
+check ovn-sbctl remove SB_Global . connections $readonly_connection
+check ovn-nbctl --wait=hv set Logical_Router lr \
+    options:mac_binding_age_threshold=5
+check ip route add 203.0.113.0/24 via $peer_ip dev br-uplink \
+    onlink table 1337 proto bgp
+wait_row_count MAC_Binding 1 logical_port=lrp-uplink ip=$peer_ip \
+    mac='"00:00:00:00:20:02"'
+check ovn-nbctl --wait=hv sync
+binding=$(fetch_column MAC_Binding _uuid logical_port=lrp-uplink ip=$peer_ip)
+
+AS_BOX([Withdrawal preserves a row whose IP was repurposed])
+dnl Preserve the controller's ownership bookkeeping while both the SB key
+dnl and its kernel route change. Restarting would lose the recorded UUID
+dnl and would not exercise conditional cleanup of an owned binding.
+check kill -STOP $controller_pid
+check ovn-sbctl set MAC_Binding $binding ip=198.51.100.254
+check ip route del 203.0.113.0/24 table 1337
+check kill -CONT $controller_pid
+wait_row_count Learned_Route 0 logical_port=$lrp
+wait_row_count MAC_Binding 0 logical_port=lrp-uplink ip=$peer_ip
+check_row_count MAC_Binding 1 ip=198.51.100.254 \
+    logical_port=lrp-uplink datapath=$router_dp \
+    mac='"00:00:00:00:20:02"'
+check_column "$binding" MAC_Binding _uuid \
+    logical_port=lrp-uplink ip=198.51.100.254
+AT_CHECK([ip neigh show dev br-uplink to $peer_ip | \
+    grep -c 'lladdr 00:00:00:00:20:02 PERMANENT'], [0], [1
+])
+check ovn-sbctl destroy MAC_Binding $binding
+
+AS_BOX([Native learning resumes after the port leaves resolver scope])
+check ip route add 203.0.113.0/24 via $peer_ip dev br-uplink \
+    onlink table 1337 proto bgp
+wait_row_count MAC_Binding 1 logical_port=lrp-uplink ip=$peer_ip \
+    mac='"00:00:00:00:20:02"'
+check ovn-nbctl --wait=hv sync
+ordinary_binding=$(fetch_column MAC_Binding _uuid \
+    logical_port=lrp-uplink ip=$peer_ip)
+check kill -STOP $controller_pid
+check ovn-sbctl set MAC_Binding $ordinary_binding mac='"00:00:00:00:20:fe"'
+check ip route del 203.0.113.0/24 table 1337
+check ovn-nbctl set Logical_Router_Port lrp-uplink networks=$host_ip/30
+check kill -CONT $controller_pid
+check ovn-nbctl --wait=hv sync
+wait_row_count Learned_Route 0 logical_port=$lrp
+check_row_count MAC_Binding 1 \
+    logical_port=lrp-uplink ip=$peer_ip mac='"00:00:00:00:20:fe"'
+check_column "$ordinary_binding" MAC_Binding _uuid \
+    logical_port=lrp-uplink ip=$peer_ip
+dnl Announcements during the bounded retirement fence may be discarded.
+dnl Fresh ordinary learning must eventually replace this edited same-key
+dnl row without the resolver deleting it or requiring a controller restart.
+OVS_WAIT_UNTIL([
+    ip netns exec peer arping -U -c 1 -w 2 -I peer $peer_ip \
+        > /dev/null 2>&1
+    test 1 = $(count_rows MAC_Binding \
+        logical_port=lrp-uplink ip=$peer_ip mac='"00:00:00:00:20:02"')
+])
+check_column "$ordinary_binding" MAC_Binding _uuid \
+    logical_port=lrp-uplink ip=$peer_ip
+AT_CHECK([ip neigh show dev br-uplink to $peer_ip | \
+    grep -c 'lladdr 00:00:00:00:20:02 PERMANENT'], [0], [1
+])
+
+check ovn-nbctl --wait=hv lr-del lr
+OVN_CLEANUP_CONTROLLER([hv1])
+OVN_CLEANUP_NORTHD
+
+as
+OVS_TRAFFIC_VSWITCHD_STOP(["/failed to query port patch-.*/d
+/connection dropped.*/d"])
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([dynamic-routing - multiple DGP])
 
 VRF_RESERVE([1337])

@@ -21,6 +21,7 @@
 #include "lflow.h"
 #include "lib/vec.h"
 #include "mac-cache.h"
+#include "route-neighbor.h"
 #include "openvswitch/ofp-errors.h"
 #include "openvswitch/ofp-flow.h"
 #include "openvswitch/ofp-msgs.h"
@@ -189,7 +190,8 @@ void
 statctrl_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
              struct ovsdb_idl_index *sbrec_port_binding_by_name,
              const struct sbrec_chassis *chassis,
-             struct mac_cache_data *mac_cache_data)
+             struct mac_cache_data *mac_cache_data,
+             struct route_neighbor_state *route_neighbors)
 {
     if (!ovnsb_idl_txn) {
         return;
@@ -201,6 +203,7 @@ statctrl_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
         .sbrec_port_binding_by_name = sbrec_port_binding_by_name,
         .swconn = statctrl_ctx.swconn,
         .chassis = chassis,
+        .route_neighbors = route_neighbors,
     };
 
     void *node_data[STATS_MAX] = {
@@ -238,6 +241,20 @@ statctrl_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
 
         if (!node->drain) {
             continue;
+        }
+
+        if (i == STATS_MAC_BINDING) {
+            /* Dataplane use is not confirmation that a managed kernel
+             * neighbor remains reachable.  Only its resolver renews it. */
+            struct ovsdb_idl *idl = ovsdb_idl_txn_get_idl(ovnsb_idl_txn);
+            struct uuidset_node *pending;
+            UUIDSET_FOR_EACH_SAFE (pending, &node->pending) {
+                const struct sbrec_mac_binding *mb =
+                    sbrec_mac_binding_get_for_uuid(idl, &pending->uuid);
+                if (mb && route_neighbor_owns_binding(route_neighbors, mb)) {
+                    uuidset_delete(&node->pending, pending);
+                }
+            }
         }
 
         size_t pending_count = uuidset_count(&node->pending);

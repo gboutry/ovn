@@ -62,3 +62,12 @@ int route_exchange_status_run(void)
 {
     return 0;
 }
+
+bool
+route_exchange_get_next_hops(
+    const struct route_exchange_state *state OVS_UNUSED,
+    const struct hmap *announce_routes OVS_UNUSED,
+    struct vector *next_hops OVS_UNUSED)
+{
+    return false;
+}

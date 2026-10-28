@@ -726,3 +726,51 @@ route_exchange_status_run(void)
 {
     return route_exchange_nl_status;
 }
+
+/* Collect next hops from the same resolved route cache used to populate
+ * Learned_Route.  No database transaction or second route dump is needed. */
+bool
+route_exchange_get_next_hops(const struct route_exchange_state *state,
+                             const struct hmap *announce_routes,
+                             struct vector *next_hops)
+{
+    if (route_exchange_nl_status) {
+        return false;
+    }
+
+    const struct advertise_datapath_entry *ad;
+    HMAP_FOR_EACH (ad, node, announce_routes) {
+        struct route_table_state *rt = route_table_state_find(
+            state, route_get_table_id(ad->db));
+        if (!rt) {
+            continue;
+        }
+        struct vector routes =
+            VECTOR_EMPTY_INITIALIZER(struct re_nl_received_route_node);
+        const struct re_nl_cached_route *cr;
+        HMAP_FOR_EACH (cr, node, &rt->learned_routes) {
+            re_nl_resolve_route(cr->msg, &routes);
+        }
+        const struct re_nl_received_route_node *r;
+        VECTOR_FOR_EACH_PTR (&routes, r) {
+            if (!IN6_IS_ADDR_V4MAPPED(&r->nexthop)) {
+                continue;
+            }
+            const struct smap_node *p;
+            SMAP_FOR_EACH (p, &ad->bound_ports) {
+                if (!p->value || strcmp(p->value, r->ifname)) {
+                    continue;
+                }
+                struct route_next_hop nh = {
+                    .logical_port = p->key,
+                    .datapath = ad->db,
+                    .addr = r->nexthop,
+                };
+                ovs_strlcpy(nh.ifname, r->ifname, sizeof nh.ifname);
+                vector_push(next_hops, &nh);
+            }
+        }
+        vector_destroy(&routes);
+    }
+    return true;
+}
