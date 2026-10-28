@@ -30,3 +30,4 @@ Dynamic Routing
 
    architecture
    configuration-examples
+   next-hop-mac-resolution

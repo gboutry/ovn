@@ -28,6 +28,7 @@ DOC_SOURCE = \
 	Documentation/topics/dynamic-routing/architecture.rst \
 	Documentation/topics/dynamic-routing/configuration-examples.rst \
 	Documentation/topics/dynamic-routing/index.rst \
+	Documentation/topics/dynamic-routing/next-hop-mac-resolution.rst \
 	Documentation/topics/incremental-processing/datapath-sync-graph.png \
 	Documentation/topics/incremental-processing/evpn-arp-graph.png \
 	Documentation/topics/incremental-processing/ic-graph.png \
