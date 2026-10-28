@@ -17757,6 +17757,128 @@ AT_CLEANUP
 ])
 
 OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([dynamic-routing - next-hop GARP learning])
+AT_KEYWORDS([dynamic-routing next-hop-neighbor])
+ovn_start
+
+check ovn-nbctl lr-add lr0
+check ovn-nbctl set Logical_Router lr0 options:dynamic-routing=true
+check ovn-nbctl lrp-add lr0 lrp1 00:00:00:00:ff:01 10.0.0.1/24
+check ovn-nbctl lrp-add lr0 lrp2 00:00:00:00:ff:02
+check ovn-nbctl --wait=sb lrp-add lr0 lrp3 00:00:00:00:ff:03
+datapath=$(fetch_column datapath_binding _uuid external_ids:name=lr0)
+lrp1=$(fetch_column port_binding _uuid logical_port=lrp1)
+lrp2=$(fetch_column port_binding _uuid logical_port=lrp2)
+lrp3=$(fetch_column port_binding _uuid logical_port=lrp3)
+
+add_route() {
+    check_uuid ovn-sbctl create Learned_Route datapath=$datapath \
+        logical_port=$1 ip_prefix=\"$2\" nexthop=\"$3\"
+}
+
+dnl Select only the new, narrowly scoped announcement-learning rules.
+garp_keys() {
+    ovn-sbctl dump-flows lr0 | grep 'arp.sha != 00:00:00:00:00:00' | \
+        sed -n 's/.*inport == "\([[^"]]*\)".*arp.spa == \([[0-9.]]*\) && arp.tpa == \([[0-9.]]*\).*/\1 \2 \3/p' | sort
+}
+
+add_route $lrp2 198.51.100.1/32 192.0.2.1
+add_route $lrp2 198.51.100.2/32 192.0.2.1
+add_route $lrp3 198.51.100.1/32 192.0.2.2
+add_route $lrp1 198.51.100.3/32 10.0.0.2
+add_route $lrp2 2001:db8::/64 fe80::1
+check ovn-nbctl --wait=sb sync
+
+dnl Two prefixes sharing a next hop and an ECMP member each need one rule.
+dnl The existing subnet rule covers lrp1; an IPv6 next hop needs no ARP rule.
+AT_CHECK([garp_keys], [0], [dnl
+lrp2 192.0.2.1 192.0.2.1
+lrp3 192.0.2.2 192.0.2.2
+])
+dnl ECMP member IDs may be reassigned by a full recompute. Compare every
+dnl flow's semantics, normalizing only those arbitrary member IDs just as
+dnl the existing unnumbered-route test does; retain next hops and actions.
+semantic_flows() {
+    ovn-sbctl dump-flows lr0 | \
+        sed -e 's/reg8\[[16..31\]] == [[0-9]][[0-9]]*/reg8\[[16..31\]] == ??/g' | \
+        ovn_strip_lflows
+}
+semantic_flows > ecmp-before
+check as northd ovn-appctl -t ovn-northd inc-engine/recompute
+check ovn-nbctl --wait=sb sync
+semantic_flows > ecmp-after
+AT_CHECK([diff -u ecmp-before ecmp-after], [0], [])
+
+dnl Removing one of the references must retain permission for the next hop.
+route=$(fetch_column Learned_Route _uuid logical_port=$lrp2 \
+    ip_prefix=198.51.100.1/32)
+check ovn-sbctl destroy Learned_Route $route
+check ovn-nbctl --wait=sb sync
+AT_CHECK([garp_keys], [0], [dnl
+lrp2 192.0.2.1 192.0.2.1
+lrp3 192.0.2.2 192.0.2.2
+])
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+dnl Disabling new request learning must retain the IP-existence lookup.
+check ovn-nbctl --wait=sb set Logical_Router lr0 \
+    options:always_learn_from_arp_request=false
+AT_CHECK([ovn-sbctl dump-flows lr0 | \
+    grep 'arp.sha != 00:00:00:00:00:00' | \
+    grep -c 'lookup_arp_ip(inport, arp.spa)'], [0], [2
+])
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+dnl Changing the last route's next hop removes the old learning permission.
+route=$(fetch_column Learned_Route _uuid logical_port=$lrp2 \
+    ip_prefix=198.51.100.2/32)
+check ovn-sbctl set Learned_Route $route nexthop=192.0.2.3
+check ovn-nbctl --wait=sb sync
+AT_CHECK([garp_keys], [0], [dnl
+lrp2 192.0.2.3 192.0.2.3
+lrp3 192.0.2.2 192.0.2.2
+])
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+dnl Numbering the port makes the ordinary subnet-learning flow sufficient.
+check ovn-nbctl --wait=sb set Logical_Router_Port lrp2 \
+    networks=192.0.2.10/24
+AT_CHECK([garp_keys], [0], [dnl
+lrp3 192.0.2.2 192.0.2.2
+])
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+dnl Withdraw the remaining unnumbered next hop, including its flow reference.
+route=$(fetch_column Learned_Route _uuid logical_port=$lrp3)
+check ovn-sbctl destroy Learned_Route $route
+check ovn-nbctl --wait=sb sync
+AT_CHECK([garp_keys], [0], [])
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+dnl A successfully parsed static route may also have an off-prefix next hop.
+check ovn-nbctl --wait=sb lr-route-add lr0 203.0.113.0/24 192.0.2.7 lrp1
+AT_CHECK([garp_keys], [0], [dnl
+lrp1 192.0.2.7 192.0.2.7
+])
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+dnl Distributed gateway learning retains active-chassis residency gating.
+check ovn-sbctl chassis-add hv1 geneve 127.0.0.1
+check ovn-nbctl --wait=sb lrp-set-gateway-chassis lrp3 hv1 20
+check ovn-sbctl lsp-bind cr-lrp3 hv1
+add_route $lrp3 198.51.100.4/32 192.0.2.4
+check ovn-nbctl --wait=sb sync
+AT_CHECK([ovn-sbctl dump-flows lr0 | \
+    grep 'arp.sha != 00:00:00:00:00:00' | \
+    grep -c 'is_chassis_resident("cr-lrp3")'], [0], [1
+])
+CHECK_NO_CHANGE_AFTER_RECOMPUTE
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
 AT_SETUP([dynamic-routing - route learning cleanup - router recreation])
 AT_KEYWORDS([dynamic-routing])
 ovn_start

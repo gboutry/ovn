@@ -5740,6 +5740,109 @@ AT_CLEANUP
 ])
 
 OVN_FOR_EACH_NORTHD([
+AT_SETUP([MAC binding learning from next-hop GARP])
+AT_KEYWORDS([dynamic-routing next-hop-neighbor])
+CHECK_SCAPY
+ovn_start
+
+check ovn-nbctl lr-add lr0
+check ovn-nbctl set Logical_Router lr0 options:chassis=hv1 \
+    options:dynamic-routing=true
+for i in 1 2; do
+    check ovn-nbctl ls-add sw$i
+    check ovn-nbctl lrp-add lr0 lrp$i 00:00:00:00:ff:0$i
+    dnl Keep this simulated learned-route fixture independent of host routes.
+    check ovn-nbctl set Logical_Router_Port lrp$i \
+        options:dynamic-routing-port-name=unmapped-test-interface
+    check ovn-nbctl lsp-add-router-port sw$i sw$i-lr0 lrp$i
+    check ovn-nbctl lsp-add sw$i ext$i
+    check ovn-nbctl lsp-set-addresses ext$i unknown
+done
+
+net_add n1
+sim_add hv1
+as hv1
+check ovs-vsctl add-br br-phys
+ovn_attach n1 br-phys 192.168.0.1
+for i in 1 2; do
+    check ovs-vsctl add-port br-int ext$i -- set Interface ext$i \
+        external_ids:iface-id=ext$i
+done
+
+check ovn-nbctl --wait=hv sync
+datapath=$(fetch_column Datapath_Binding _uuid external_ids:name=lr0)
+lrp=$(fetch_column Port_Binding _uuid logical_port=lrp1)
+check_uuid ovn-sbctl create Learned_Route datapath=$datapath \
+    logical_port=$lrp ip_prefix=0.0.0.0/0 nexthop=192.0.2.1
+check ovn-nbctl --wait=hv sync
+wait_for_ports_up
+
+trace_garp() {
+    ovn-trace lr0 "inport == \"$1\" && eth.src == $2 && \
+        eth.dst == ff:ff:ff:ff:ff:ff && arp && arp.op == 1 && \
+        arp.spa == $3 && arp.tpa == $4 && arp.sha == $5 && \
+        arp.tha == 00:00:00:00:00:00" | grep -c 'put_arp'
+}
+
+AS_BOX([Only valid GARP for this port's route next hop may learn])
+AT_CHECK([trace_garp lrp2 f0:00:00:00:00:01 192.0.2.1 192.0.2.1 \
+    f0:00:00:00:00:01], [1], [0
+])
+AT_CHECK([trace_garp lrp1 f0:00:00:00:00:01 192.0.2.9 192.0.2.9 \
+    f0:00:00:00:00:01], [1], [0
+])
+AT_CHECK([trace_garp lrp1 f0:00:00:00:00:01 192.0.2.1 192.0.2.10 \
+    f0:00:00:00:00:01], [1], [0
+])
+AT_CHECK([trace_garp lrp1 f0:00:00:00:00:01 192.0.2.1 192.0.2.1 \
+    00:00:00:00:00:00], [1], [0
+])
+AT_CHECK([trace_garp lrp1 f0:00:00:00:00:01 192.0.2.1 192.0.2.1 \
+    f1:00:00:00:00:01], [1], [0
+])
+AT_CHECK([trace_garp lrp1 00:00:00:00:00:00 192.0.2.1 192.0.2.1 \
+    f0:00:00:00:00:01], [1], [0
+])
+AT_CHECK([trace_garp lrp1 f1:00:00:00:00:01 192.0.2.1 192.0.2.1 \
+    f0:00:00:00:00:01], [1], [0
+])
+
+sha=f0:00:00:00:00:01
+AS_BOX([The learning option still suppresses unknown request senders])
+check ovn-nbctl --wait=hv set Logical_Router lr0 \
+    options:always_learn_from_arp_request=false
+AT_CHECK([trace_garp lrp1 $sha 192.0.2.1 192.0.2.1 $sha], [1], [0
+])
+
+AS_BOX([A cold next-hop binding is learned from an actual GARP packet])
+check ovn-nbctl --wait=hv set Logical_Router lr0 \
+    options:always_learn_from_arp_request=true
+packet=$(dump_arp 1 $sha ff:ff:ff:ff:ff:ff 192.0.2.1 192.0.2.1 \
+    00:00:00:00:00:00)
+check as hv1 ovs-appctl netdev-dummy/receive ext1 $packet
+wait_row_count MAC_Binding 1 logical_port=lrp1 ip=192.0.2.1 mac=\"$sha\"
+
+AS_BOX([An already known next hop may update its MAC when the option is false])
+check ovn-nbctl --wait=hv set Logical_Router lr0 \
+    options:always_learn_from_arp_request=false
+sha=f0:00:00:00:00:02
+packet=$(dump_arp 1 $sha ff:ff:ff:ff:ff:ff 192.0.2.1 192.0.2.1 \
+    00:00:00:00:00:00)
+check as hv1 ovs-appctl netdev-dummy/receive ext1 $packet
+wait_row_count MAC_Binding 1 logical_port=lrp1 ip=192.0.2.1 mac=\"$sha\"
+
+AS_BOX([Withdrawal removes the extra learning permission])
+check ovn-sbctl --all destroy Learned_Route
+check ovn-nbctl --wait=hv sync
+sha=f0:00:00:00:00:03
+AT_CHECK([trace_garp lrp1 $sha 192.0.2.1 192.0.2.1 $sha], [1], [0
+])
+
+OVN_CLEANUP([hv1])
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([MAC binding learning from ARP request and ND NS])
 CHECK_SCAPY
 ovn_start

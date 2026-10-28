@@ -15507,6 +15507,17 @@ build_neigh_learning_flows_for_lrouter(
                                lflow_ref);
 }
 
+static void
+build_arp_request_lookup_actions(struct ds *actions, bool learn_from_request)
+{
+    ds_clear(actions);
+    ds_put_format(actions, REGBIT_LOOKUP_NEIGHBOR_RESULT
+                  " = lookup_arp(inport, arp.spa, arp.sha); %snext;",
+                  learn_from_request ? "" :
+                  REGBIT_LOOKUP_NEIGHBOR_IP_RESULT
+                  " = lookup_arp_ip(inport, arp.spa); ");
+}
+
 /* Logical router ingress Table 1: Neighbor lookup lflows
  * for logical router ports. */
 static void
@@ -15556,12 +15567,7 @@ build_neigh_learning_flows_for_lrouter_port(
             ds_put_format(match, " && is_chassis_resident(%s)",
                           op->cr_port->json_key);
         }
-        ds_clear(actions);
-        ds_put_format(actions, REGBIT_LOOKUP_NEIGHBOR_RESULT
-                      " = lookup_arp(inport, arp.spa, arp.sha); %snext;",
-                      learn_from_arp_request ? "" :
-                      REGBIT_LOOKUP_NEIGHBOR_IP_RESULT
-                      " = lookup_arp_ip(inport, arp.spa); ");
+        build_arp_request_lookup_actions(actions, learn_from_arp_request);
         ovn_lflow_add(lflows, op->od, S_ROUTER_IN_LOOKUP_NEIGHBOR, 100,
                       ds_cstr(match), ds_cstr(actions), lflow_ref,
                       WITH_HINT(&op->nbrp->header_));
@@ -15792,14 +15798,75 @@ build_default_route_flows_for_lrouter(
 
 }
 
+/* Learn announcements only for a route's next hop when subnet-based ARP
+ * request learning cannot cover it, notably on an unnumbered router port.
+ * The caller owns the flows through its grouped-route reference. */
+static void
+build_route_nexthop_garp_flow(const struct parsed_route *route,
+                             struct lflow_table *lflows,
+                             struct lflow_ref *lflow_ref,
+                             struct sset *visited)
+{
+    if (route->is_discard_route || !route->out_port || !route->nexthop ||
+        !IN6_IS_ADDR_V4MAPPED(route->nexthop)) {
+        return;
+    }
+
+    ovs_be32 ip = in6_addr_get_mapped_ipv4(route->nexthop);
+    if (!ip || ip == htonl(UINT32_MAX) || ip_is_multicast(ip)) {
+        return;
+    }
+
+    const struct ovn_port *op = route->out_port;
+    char ip_s[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &ip, ip_s, sizeof ip_s);
+    if (lrp_find_member_ip(op, ip_s)) {
+        return;
+    }
+
+    char *key = xasprintf("%s,%s", op->key, ip_s);
+    bool added = sset_add(visited, key);
+    free(key);
+    if (!added) {
+        return;
+    }
+
+    struct ds match = DS_EMPTY_INITIALIZER;
+    struct ds actions = DS_EMPTY_INITIALIZER;
+    ds_put_format(&match, "inport == %s && arp.op == 1 && "
+                  "arp.spa == %s && arp.tpa == %s && "
+                  "arp.sha != 00:00:00:00:00:00 && arp.sha[40] == 0 && "
+                  "eth.src != 00:00:00:00:00:00 && eth.src[40] == 0",
+                  op->json_key, ip_s, ip_s);
+    if (lrp_is_l3dgw(op)) {
+        ds_put_format(&match, " && is_chassis_resident(%s)",
+                      op->cr_port->json_key);
+    }
+    build_arp_request_lookup_actions(
+        &actions, smap_get_bool(&op->od->nbr->options,
+                               "always_learn_from_arp_request", true));
+    ovn_lflow_add(lflows, op->od, S_ROUTER_IN_LOOKUP_NEIGHBOR, 100,
+                  ds_cstr(&match), ds_cstr(&actions), lflow_ref,
+                  WITH_HINT(&op->nbrp->header_));
+    ds_destroy(&match);
+    ds_destroy(&actions);
+}
+
 void
 build_route_data_flows_for_lrouter(
         const struct ovn_datapath *od, struct lflow_table *lflows,
         const struct group_ecmp_datapath *route_node,
         const struct sset *bfd_ports)
 {
+    struct sset visited_nexthops = SSET_INITIALIZER(&visited_nexthops);
     struct ecmp_groups_node *group;
     HMAP_FOR_EACH (group, hmap_node, &route_node->ecmp_groups) {
+        const struct ecmp_route_list_node *er;
+        VECTOR_FOR_EACH_PTR (&group->route_list, er) {
+            build_route_nexthop_garp_flow(er->route, lflows,
+                                         route_node->lflow_ref,
+                                         &visited_nexthops);
+        }
         /* add a flow in IP_ROUTING, and one flow for each member in
          * IP_ROUTING_ECMP. */
         build_ecmp_route_flow(lflows, od, group, route_node->lflow_ref, NULL);
@@ -15818,9 +15885,13 @@ build_route_data_flows_for_lrouter(
     }
     const struct unique_routes_node *ur;
     HMAP_FOR_EACH (ur, hmap_node, &route_node->unique_routes) {
+        build_route_nexthop_garp_flow(ur->route, lflows,
+                                     route_node->lflow_ref,
+                                     &visited_nexthops);
         build_route_flow(lflows, od, ur->route, bfd_ports,
                          route_node->lflow_ref);
     }
+    sset_destroy(&visited_nexthops);
 }
 
 static void
