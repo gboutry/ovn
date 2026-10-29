@@ -199,8 +199,9 @@ parse_route_from_sbrec_route(struct hmap *parsed_routes_out,
         return NULL;
     }
 
-    return parsed_route_add(od, nexthop, &prefix, plen, false, lrp_addr_s,
-                            out_port, 0, false, false, false, NULL,
+    return parsed_route_add(od, nexthop, NULL, &prefix, plen, false,
+                            lrp_addr_s, out_port, 0, false, false, false,
+                            NULL,
                             ROUTE_SOURCE_LEARNED, true, &route->header_, NULL,
                             parsed_routes_out);
 }

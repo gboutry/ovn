@@ -19553,6 +19553,12 @@ datapath_lr0=$(fetch_column Datapath_Binding _uuid external_ids:name=lr0)
 pb_lr0_up=$(fetch_column Port_Binding _uuid logical_port=lr0-up)
 pb_be_vm1=$(fetch_column Port_Binding _uuid logical_port=be-vm1)
 
+check_fip_mac() {
+    ovn-sbctl lflow-list lr0 > lr0_flows || return 2
+    grep 'lr_in_arp_resolve.*outport == "lr0-up" && reg0 == 10.0.0.1@<:@01@:>@' lr0_flows > lr0_mac_flows || return $?
+    ovn_strip_lflows < lr0_mac_flows
+}
+
 check_fip_route() {
     ovn-sbctl lflow-list lr0 > lr0_flows
     grep 'lr_in_ip_routing.*10.0.0.1@<:@01@:>@/32' lr0_flows | ovn_strip_lflows
@@ -19566,6 +19572,72 @@ AT_CHECK([check_fip_route], [0], [dnl
   table=??(lr_in_ip_routing   ), priority=1935 , match=(ip4.dst == 10.0.0.10/32), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = 10.0.0.10; eth.src = 00:00:00:00:00:01; outport = "lr0-up"; flags.loopback = 1; reg9[[9]] = 1; next;)
 ])
 
+# Forwarding uses the NB-known NAT MAC independently of learned neighbors.
+AT_CHECK([check_fip_mac], [0], [dnl
+  table=??(lr_in_arp_resolve  ), priority=100  , match=(reg9[[9]] == 1 && outport == "lr0-up" && reg0 == 10.0.0.10), action=(eth.dst = 00:00:00:00:01:02; next;)
+])
+
+# A MAC-only update must replace the owned resolve flow incrementally.
+nat_uuid=$(ovn-nbctl --bare --columns=_uuid find NAT external_ip=10.0.0.10)
+check ovn-nbctl --wait=sb set NAT $nat_uuid external_mac="\"00:00:00:00:01:03\""
+AT_CHECK([check_fip_mac], [0], [dnl
+  table=??(lr_in_arp_resolve  ), priority=100  , match=(reg9[[9]] == 1 && outport == "lr0-up" && reg0 == 10.0.0.10), action=(eth.dst = 00:00:00:00:01:03; next;)
+])
+check ovn-nbctl --wait=sb set NAT $nat_uuid external_mac="\"00:00:00:00:01:02\""
+
+# Equal contributors share one MAC flow.  An ambiguous MAC for the same
+# output port and next-hop IP must not depend on ECMP iteration order.
+check ovn-nbctl lr-add lr2
+check ovn-nbctl lrp-add lr2 lr2-up 00:00:00:00:00:04 10.0.0.2/24
+check ovn-nbctl lrp-set-gateway-chassis lr2-up hv3
+check ovn-nbctl lsp-add-router-port provider prov-lr2 lr2-up
+check ovn-nbctl lrp-add lr2 lr2-be 00:00:00:00:00:05 192.168.2.1/24
+check ovn-nbctl ls-add be2
+check ovn-nbctl lsp-add-router-port be2 be2-lr2 lr2-be
+check ovn-nbctl lsp-add be2 be-vm2
+check ovn-nbctl lsp-set-addresses be-vm2 "00:00:00:00:02:01 192.168.2.10"
+check ovn-nbctl --wait=sb lr-nat-add lr2 dnat_and_snat \
+    10.0.0.10 192.168.2.10 be-vm2 00:00:00:00:01:02
+AT_CHECK([check_fip_mac], [0], [dnl
+  table=??(lr_in_arp_resolve  ), priority=100  , match=(reg9[[9]] == 1 && outport == "lr0-up" && reg0 == 10.0.0.10), action=(eth.dst = 00:00:00:00:01:02; next;)
+])
+nat2_uuid=$(ovn-nbctl --bare --columns=_uuid find NAT logical_ip=192.168.2.10)
+check ovn-nbctl --wait=sb set NAT $nat2_uuid external_mac="\"00:00:00:00:02:02\""
+AT_CHECK([check_fip_mac], [0], [dnl
+  table=??(lr_in_arp_resolve  ), priority=100  , match=(reg9[[9]] == 1 && outport == "lr0-up" && reg0 == 10.0.0.10), action=(drop;)
+])
+check ovn-nbctl --wait=sb lr-nat-del lr2 dnat_and_snat 10.0.0.10
+AT_CHECK([check_fip_mac], [0], [dnl
+  table=??(lr_in_arp_resolve  ), priority=100  , match=(reg9[[9]] == 1 && outport == "lr0-up" && reg0 == 10.0.0.10), action=(eth.dst = 00:00:00:00:01:02; next;)
+])
+
+# The same destination through different output ports keeps each selected
+# next hop's MAC, including when the routes form an ECMP group.
+check ovn-nbctl lsp-del prov-lr2
+check ovn-nbctl lrp-del lr2-up
+check ovn-nbctl ls-add provider2
+check ovn-nbctl lsp-add-localnet-port provider2 ln-prov2 physnet2
+check ovn-nbctl lrp-add lr0 lr0-up2 00:00:00:00:00:06
+check ovn-nbctl lrp-set-options lr0-up2 dynamic-routing-redistribute=nat
+check ovn-nbctl lsp-add-router-port provider2 prov2-lr0 lr0-up2
+check ovn-nbctl lrp-add lr2 lr2-up2 00:00:00:00:00:07 10.1.0.1/24
+check ovn-nbctl lrp-set-gateway-chassis lr2-up2 hv3
+check ovn-nbctl lsp-add-router-port provider2 prov2-lr2 lr2-up2
+check ovn-nbctl --wait=sb lr-nat-add lr2 dnat_and_snat \
+    10.0.0.10 192.168.2.10 be-vm2 00:00:00:00:02:02
+AT_CHECK([check_fip_mac], [0], [dnl
+  table=??(lr_in_arp_resolve  ), priority=100  , match=(reg9[[9]] == 1 && outport == "lr0-up" && reg0 == 10.0.0.10), action=(eth.dst = 00:00:00:00:01:02; next;)
+])
+AT_CHECK([grep 'lr_in_arp_resolve.*outport == "lr0-up2" && reg0 == 10.0.0.10' lr0_flows | ovn_strip_lflows], [0], [dnl
+  table=??(lr_in_arp_resolve  ), priority=100  , match=(reg9[[9]] == 1 && outport == "lr0-up2" && reg0 == 10.0.0.10), action=(eth.dst = 00:00:00:00:02:02; next;)
+])
+AT_CHECK([grep 'lr_in_ip_routing_ecmp.*reg0 = 10.0.0.10;' lr0_flows | grep -c 'outport = "lr0-up'], [0], [2
+])
+check ovn-nbctl --wait=sb lrp-del lr0-up2
+ovn-sbctl lflow-list lr0 > lr0_flows
+AT_CHECK([grep 'lr_in_arp_resolve.*outport == "lr0-up2"' lr0_flows], [1])
+check ovn-nbctl --wait=sb lr-del lr2
+
 # Changing the FIP replaces both its advertisement and forwarding route.
 nat_uuid=$(ovn-nbctl --bare --columns=_uuid find NAT external_ip=10.0.0.10)
 check ovn-nbctl --wait=sb set NAT $nat_uuid external_ip=10.0.0.11
@@ -19576,8 +19648,13 @@ AT_CHECK([check_fip_route], [0], [dnl
   table=??(lr_in_ip_routing   ), priority=1935 , match=(ip4.dst == 10.0.0.11/32), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = 10.0.0.11; eth.src = 00:00:00:00:00:01; outport = "lr0-up"; flags.loopback = 1; reg9[[9]] = 1; next;)
 ])
 
+AT_CHECK([check_fip_mac], [0], [dnl
+  table=??(lr_in_arp_resolve  ), priority=100  , match=(reg9[[9]] == 1 && outport == "lr0-up" && reg0 == 10.0.0.11), action=(eth.dst = 00:00:00:00:01:02; next;)
+])
+
 # Centralized NAT must continue using the gateway as next hop.
 check ovn-nbctl --wait=sb clear NAT $nat_uuid logical_port external_mac
+AT_CHECK([check_fip_mac], [1])
 ovn-sbctl lflow-list lr0 > lr0_flows
 AT_CHECK([grep 'lr_in_ip_routing.*10.0.0.11/32' lr0_flows | ovn_strip_lflows], [0], [dnl
   table=??(lr_in_ip_routing   ), priority=1935 , match=(ip4.dst == 10.0.0.11/32), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = 10.0.0.1; eth.src = 00:00:00:00:00:01; outport = "lr0-up"; flags.loopback = 1; reg9[[9]] = 1; next;)
@@ -19589,6 +19666,20 @@ check_row_count Advertised_Route 1 ip_prefix=10.0.0.11 \
     datapath=$datapath_lr0 logical_port=$pb_lr0_up tracked_port=$pb_be_vm1
 AT_CHECK([check_fip_route], [0], [dnl
   table=??(lr_in_ip_routing   ), priority=1935 , match=(ip4.dst == 10.0.0.11/32), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = 10.0.0.11; eth.src = 00:00:00:00:00:01; outport = "lr0-up"; flags.loopback = 1; reg9[[9]] = 1; next;)
+])
+
+AT_CHECK([check_fip_mac], [0], [dnl
+  table=??(lr_in_arp_resolve  ), priority=100  , match=(reg9[[9]] == 1 && outport == "lr0-up" && reg0 == 10.0.0.11), action=(eth.dst = 00:00:00:00:01:02; next;)
+])
+
+# Removing the advertising adjacency removes its owned MAC flow.
+check ovn-nbctl --wait=sb lrp-del lr0-up
+AT_CHECK([check_fip_mac], [1])
+check ovn-nbctl lrp-add lr0 lr0-up 00:00:00:00:00:01
+check ovn-nbctl lrp-set-options lr0-up dynamic-routing-redistribute=nat
+check ovn-nbctl --wait=sb lsp-set-options prov-lr0 router-port=lr0-up
+AT_CHECK([check_fip_mac], [0], [dnl
+  table=??(lr_in_arp_resolve  ), priority=100  , match=(reg9[[9]] == 1 && outport == "lr0-up" && reg0 == 10.0.0.11), action=(eth.dst = 00:00:00:00:01:02; next;)
 ])
 
 # A full recomputation must produce the same flows as the incremental
@@ -19603,6 +19694,7 @@ check ovn-nbctl --wait=sb lr-nat-del lr1 dnat_and_snat 10.0.0.11
 check_row_count Advertised_Route 0 ip_prefix=10.0.0.11
 ovn-sbctl lflow-list lr0 > lr0_flows
 AT_CHECK([grep 'lr_in_ip_routing.*10.0.0.11/32' lr0_flows], [1])
+AT_CHECK([check_fip_mac], [1])
 
 OVN_CLEANUP_NORTHD
 AT_CLEANUP
@@ -19642,6 +19734,11 @@ check_row_count Advertised_Route 1 \
 ovn-sbctl lflow-list lr0 > lr0_flows
 AT_CHECK([grep 'lr_in_ip_routing.*2001:db8:ffff::10/128' lr0_flows | ovn_strip_lflows], [0], [dnl
   table=??(lr_in_ip_routing   ), priority=3087 , match=(ip6.dst == 2001:db8:ffff::10/128), action=(ip.ttl--; reg8[[0..15]] = 0; xxreg0 = 2001:db8:ffff::10; eth.src = 00:00:00:00:00:01; outport = "lr0-up"; flags.loopback = 1; reg9[[9]] = 0; next;)
+])
+
+# The off-prefix IPv6 next hop also uses its known external MAC.
+AT_CHECK([grep 'lr_in_arp_resolve.*outport == "lr0-up" && xxreg0 == 2001:db8:ffff::10' lr0_flows | ovn_strip_lflows], [0], [dnl
+  table=??(lr_in_arp_resolve  ), priority=100  , match=(reg9[[9]] == 0 && outport == "lr0-up" && xxreg0 == 2001:db8:ffff::10), action=(eth.dst = 00:00:00:00:01:02; next;)
 ])
 
 OVN_CLEANUP_NORTHD

@@ -12741,6 +12741,10 @@ parsed_route_lookup(struct hmap *routes, size_t hash,
             continue;
         }
 
+        if (!eth_addr_equals(pr->nexthop_mac, new_pr->nexthop_mac)) {
+            continue;
+        }
+
         if (!ipv6_addr_equals(&pr->prefix, &new_pr->prefix)) {
             continue;
         }
@@ -12805,6 +12809,7 @@ parsed_route_lookup(struct hmap *routes, size_t hash,
 static struct parsed_route *
 parsed_route_init(const struct ovn_datapath *od,
                   struct in6_addr *nexthop,
+                  const struct eth_addr *nexthop_mac,
                   const struct in6_addr prefix,
                   unsigned int plen,
                   bool is_discard_route,
@@ -12826,6 +12831,9 @@ parsed_route_init(const struct ovn_datapath *od,
     new_pr->prefix = prefix;
     new_pr->plen = plen;
     new_pr->nexthop = nexthop;
+    if (nexthop_mac) {
+        new_pr->nexthop_mac = *nexthop_mac;
+    }
     new_pr->route_table_id = route_table_id;
     new_pr->is_src_route = is_src_route;
     new_pr->od = od;
@@ -12858,7 +12866,8 @@ parsed_route_clone(const struct parsed_route *pr)
     }
 
     struct parsed_route *new_pr = parsed_route_init(
-        pr->od, nexthop, pr->prefix, pr->plen, pr->is_discard_route,
+        pr->od, nexthop, &pr->nexthop_mac, pr->prefix, pr->plen,
+        pr->is_discard_route,
         pr->lrp_addr_s, pr->out_port, pr->route_table_id, pr->is_src_route,
         pr->ecmp_symmetric_reply, pr->override_connected,
         &pr->ecmp_selection_fields, pr->source, pr->dynamic_routing_advertise,
@@ -12913,6 +12922,7 @@ parsed_route_free(struct parsed_route *pr) {
 struct parsed_route *
 parsed_route_add(const struct ovn_datapath *od,
                  struct in6_addr *nexthop,
+                 const struct eth_addr *nexthop_mac,
                  const struct in6_addr *prefix,
                  unsigned int plen,
                  bool is_discard_route,
@@ -12931,7 +12941,8 @@ parsed_route_add(const struct ovn_datapath *od,
 {
 
     struct parsed_route *new_pr
-        = parsed_route_init(od, nexthop, *prefix, plen, is_discard_route,
+        = parsed_route_init(od, nexthop, nexthop_mac, *prefix, plen,
+                            is_discard_route,
                             lrp_addr_s, out_port, route_table_id,
                             is_src_route, ecmp_symmetric_reply,
                             override_connected, ecmp_selection_fields,
@@ -13079,8 +13090,9 @@ parsed_routes_add_static(const struct ovn_datapath *od,
     bool dynamic_routing_advertise = smap_get_bool(&route->options,
                                                    "dynamic-routing-advertise",
                                                    true);
-    struct parsed_route *pr = parsed_route_add(od, nexthop, &prefix, plen,
-                                               is_discard_route, lrp_addr_s,
+    struct parsed_route *pr = parsed_route_add(od, nexthop, NULL, &prefix,
+                                               plen, is_discard_route,
+                                               lrp_addr_s,
                                                out_port, route_table_id,
                                                is_src_route,
                                                ecmp_symmetric_reply,
@@ -13102,7 +13114,7 @@ parsed_routes_add_connected(const struct ovn_datapath *od,
         struct in6_addr prefix;
 
         in6_addr_set_mapped_ipv4(&prefix, addr->network);
-        parsed_route_add(od, NULL, &prefix, addr->plen,
+        parsed_route_add(od, NULL, NULL, &prefix, addr->plen,
                          false, addr->addr_s, op, 0, false, false,
                          false, NULL, ROUTE_SOURCE_CONNECTED,
                          true, &op->nbrp->header_, NULL, routes);
@@ -13111,7 +13123,7 @@ parsed_routes_add_connected(const struct ovn_datapath *od,
     for (size_t i = 0; i < op->lrp_networks.n_ipv6_addrs; i++) {
         const struct ipv6_netaddr *addr = &op->lrp_networks.ipv6_addrs[i];
 
-        parsed_route_add(od, NULL, &addr->network, addr->plen, false,
+        parsed_route_add(od, NULL, NULL, &addr->network, addr->plen, false,
                          addr->addr_s, op, 0, false, false, false,
                          NULL, ROUTE_SOURCE_CONNECTED, true,
                          &op->nbrp->header_, NULL, routes);
@@ -15852,6 +15864,75 @@ build_route_nexthop_garp_flow(const struct parsed_route *route,
     ds_destroy(&actions);
 }
 
+struct route_nexthop_mac {
+    const struct parsed_route *route;
+    bool conflict;
+};
+
+/* Collect authoritative MACs before emitting flows so duplicate contributors
+ * cannot install competing actions for the same output port and next hop. */
+static void
+route_nexthop_mac_add(const struct parsed_route *route, struct shash *nexthops)
+{
+    if (route->is_discard_route || !route->out_port || !route->nexthop ||
+        eth_addr_is_zero(route->nexthop_mac)) {
+        return;
+    }
+
+    struct ds key = DS_EMPTY_INITIALIZER;
+    ds_put_format(&key, "%s,", route->out_port->key);
+    ipv6_format_mapped(route->nexthop, &key);
+    struct route_nexthop_mac *nh = shash_find_data(nexthops, ds_cstr(&key));
+    if (nh) {
+        if (!eth_addr_equals(nh->route->nexthop_mac, route->nexthop_mac)) {
+            nh->conflict = true;
+        }
+    } else {
+        nh = xmalloc(sizeof *nh);
+        nh->route = route;
+        nh->conflict = false;
+        shash_add(nexthops, ds_cstr(&key), nh);
+    }
+    ds_destroy(&key);
+}
+
+static void
+build_route_nexthop_mac_flows(const struct shash *nexthops,
+                             struct lflow_table *lflows,
+                             struct lflow_ref *lflow_ref)
+{
+    struct shash_node *node;
+    SHASH_FOR_EACH (node, nexthops) {
+        const struct route_nexthop_mac *nh = node->data;
+        const struct parsed_route *route = nh->route;
+        struct ds match = DS_EMPTY_INITIALIZER;
+        struct ds actions = DS_EMPTY_INITIALIZER;
+        bool is_ipv4 = IN6_IS_ADDR_V4MAPPED(route->nexthop);
+        ds_put_format(&match, REGBIT_NEXTHOP_IS_IPV4" == %d && "
+                      "outport == %s && %s == ", is_ipv4,
+                      route->out_port->json_key,
+                      is_ipv4 ? REG_NEXT_HOP_IPV4 : REG_NEXT_HOP_IPV6);
+        ipv6_format_mapped(route->nexthop, &match);
+        if (nh->conflict) {
+            /* A neighbor lookup cannot choose between different MACs for
+             * this output port and IP. Drop instead of emitting conflicting
+             * flows or selecting one contributor arbitrarily. */
+            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
+            VLOG_WARN_RL(&rl, "Conflicting route next-hop MACs for %s",
+                         node->name);
+            ds_put_cstr(&actions, debug_drop_action());
+        } else {
+            ds_put_format(&actions, "eth.dst = "ETH_ADDR_FMT"; next;",
+                          ETH_ADDR_ARGS(route->nexthop_mac));
+        }
+        ovn_lflow_add(lflows, route->od, S_ROUTER_IN_ARP_RESOLVE, 100,
+                      ds_cstr(&match), ds_cstr(&actions), lflow_ref,
+                      WITH_HINT(route->source_hint));
+        ds_destroy(&match);
+        ds_destroy(&actions);
+    }
+}
+
 void
 build_route_data_flows_for_lrouter(
         const struct ovn_datapath *od, struct lflow_table *lflows,
@@ -15859,10 +15940,12 @@ build_route_data_flows_for_lrouter(
         const struct sset *bfd_ports)
 {
     struct sset visited_nexthops = SSET_INITIALIZER(&visited_nexthops);
+    struct shash known_nexthops = SHASH_INITIALIZER(&known_nexthops);
     struct ecmp_groups_node *group;
     HMAP_FOR_EACH (group, hmap_node, &route_node->ecmp_groups) {
         const struct ecmp_route_list_node *er;
         VECTOR_FOR_EACH_PTR (&group->route_list, er) {
+            route_nexthop_mac_add(er->route, &known_nexthops);
             build_route_nexthop_garp_flow(er->route, lflows,
                                          route_node->lflow_ref,
                                          &visited_nexthops);
@@ -15885,6 +15968,7 @@ build_route_data_flows_for_lrouter(
     }
     const struct unique_routes_node *ur;
     HMAP_FOR_EACH (ur, hmap_node, &route_node->unique_routes) {
+        route_nexthop_mac_add(ur->route, &known_nexthops);
         build_route_nexthop_garp_flow(ur->route, lflows,
                                      route_node->lflow_ref,
                                      &visited_nexthops);
@@ -15892,6 +15976,9 @@ build_route_data_flows_for_lrouter(
                          route_node->lflow_ref);
     }
     sset_destroy(&visited_nexthops);
+    build_route_nexthop_mac_flows(&known_nexthops, lflows,
+                                 route_node->lflow_ref);
+    shash_destroy_free_data(&known_nexthops);
 }
 
 static void

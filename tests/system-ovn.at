@@ -16882,8 +16882,55 @@ NS_CHECK_EXEC([client], [ping -q -c 3 -i 0.3 -w 3 172.16.1.100 | FORMAT_PING],
 ])
 OVS_WAIT_UNTIL([grep -F 'Request who-has 192.0.2.1 tell 192.0.2.2' \
     client-arp.tcpdump])
-wait_row_count MAC_Binding 1 logical_port=adv-shared \
-    ip='"172.16.1.100"' mac='"00:00:00:00:ee:01"'
+AS_BOX([A sibling proxy cannot override the distributed NAT next-hop MAC])
+dnl Model two localnets joined by the provider bridge. The sibling router
+dnl port proxies FIPs toward the provider network, but its MAC cannot reach
+dnl the distributed NAT backend from adv-shared.
+check ovn-nbctl \
+    -- lrp-add adv adv-interconnect 00:00:00:00:aa:03 172.16.1.254/24 \
+    -- ls-add interconnect \
+    -- lsp-add-router-port interconnect interconnect-adv adv-interconnect \
+    -- set Logical_Switch_Port interconnect-adv \
+        options:arp_proxy=172.16.1.100 \
+    -- lsp-add-localnet-port interconnect interconnect-localnet shared
+check ovn-nbctl --wait=hv sync
+OVS_WAIT_UNTIL([
+    shared_ofport=$(ovs-vsctl get Interface \
+        patch-shared-localnet-to-br-int ofport)
+    interconnect_ofport=$(ovs-vsctl get Interface \
+        patch-interconnect-localnet-to-br-int ofport)
+    test "$shared_ofport" -gt 0 && test "$interconnect_ofport" -gt 0
+])
+check ovs-ofctl add-flow br-shared \
+    "priority=10,in_port=$shared_ofport actions=set_field:00:00:00:00:aa:03->eth_dst,output:$interconnect_ofport"
+check ovs-ofctl add-flow br-shared \
+    "priority=10,in_port=$interconnect_ofport actions=output:$shared_ofport"
+check ovs-ofctl add-flow br-shared 'priority=0 actions=drop'
+
+dnl Keep the incorrect dynamic binding throughout the packet check. A
+dnl known NAT next hop must take precedence without rewriting that row.
+fip_binding=$(fetch_column MAC_Binding _uuid logical_port=adv-shared \
+    ip='"172.16.1.100"')
+if test -n "$fip_binding"; then
+    check ovn-sbctl destroy MAC_Binding $fip_binding
+fi
+adv_dp=$(fetch_column Port_Binding datapath logical_port=adv-shared)
+AT_CHECK([ovn-sbctl create MAC_Binding datapath=$adv_dp \
+    logical_port=adv-shared ip='"172.16.1.100"' mac='"00:00:00:00:aa:03"'],
+    [0], [ignore])
+fip_binding=$(fetch_column MAC_Binding _uuid logical_port=adv-shared \
+    ip='"172.16.1.100"')
+check_row_count nb:Static_MAC_Binding 0
+NS_CHECK_EXEC([client], [ip neigh flush dev client])
+NS_CHECK_EXEC([vm], [ip neigh flush dev vm])
+NS_CHECK_EXEC([client], [ping -q -c 3 -i 0.3 -w 3 172.16.1.100 | FORMAT_PING],
+    [0], [dnl
+3 packets transmitted, 3 received, 0% packet loss, time 0ms
+])
+check_row_count MAC_Binding 1 logical_port=adv-shared \
+    ip='"172.16.1.100"' mac='"00:00:00:00:aa:03"'
+check_column "$fip_binding" MAC_Binding _uuid \
+    logical_port=adv-shared ip='"172.16.1.100"'
 
 AS_BOX([Distributed NAT bypasses the remote redirect chassis])
 check ovn-nbctl --wait=hv set Logical_Router_Port tenant-shared \

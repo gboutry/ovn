@@ -860,6 +860,7 @@ struct parsed_route {
     struct hmap_node key_node;
     struct in6_addr prefix;
     struct in6_addr *nexthop; /* NULL for ROUTE_SOURCE_CONNECTED */
+    struct eth_addr nexthop_mac; /* Zero when neighbor resolution is needed. */
     unsigned int plen;
     uint32_t route_table_id;
     uint32_t hash;
@@ -889,6 +890,7 @@ void parsed_route_free(struct parsed_route *);
 struct parsed_route *parsed_route_add(
     const struct ovn_datapath *od,
     struct in6_addr *nexthop,
+    const struct eth_addr *nexthop_mac,
     const struct in6_addr *prefix,
     unsigned int plen,
     bool is_discard_route,
