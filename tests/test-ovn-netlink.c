@@ -14,7 +14,12 @@
  */
 
 #include <config.h>
+#include <errno.h>
+#include <linux/rtnetlink.h>
+#include <sys/resource.h>
 
+#include "netlink.h"
+#include "netlink-socket.h"
 #include "openvswitch/hmap.h"
 #include "route-table.h"
 #include "packets.h"
@@ -28,6 +33,231 @@
 #include "controller/neighbor.h"
 #include "controller/route.h"
 #include "controller/route-exchange-netlink.h"
+
+/* Script only the transport used by neighbor synchronization.  The normal
+ * ovstest commands delegate to the real Netlink functions.  Production
+ * binaries do not use these linker wrappers. */
+static struct {
+    bool active;
+    bool started;
+    bool finished;
+    struct ofpbuf messages[3];
+    size_t n_messages;
+    size_t next;
+    int error;
+    unsigned int adds;
+    unsigned int deletes;
+} neighbor_dump;
+
+void __real_nl_dump_start(struct nl_dump *, int, const struct ofpbuf *);
+bool __real_nl_dump_next(struct nl_dump *, struct ofpbuf *, struct ofpbuf *);
+int __real_nl_dump_done(struct nl_dump *);
+int __real_nl_transact(int, const struct ofpbuf *, struct ofpbuf **);
+void __wrap_nl_dump_start(struct nl_dump *, int, const struct ofpbuf *);
+bool __wrap_nl_dump_next(struct nl_dump *, struct ofpbuf *, struct ofpbuf *);
+int __wrap_nl_dump_done(struct nl_dump *);
+int __wrap_nl_transact(int, const struct ofpbuf *, struct ofpbuf **);
+
+void
+__wrap_nl_dump_start(struct nl_dump *dump, int protocol,
+                     const struct ofpbuf *request)
+{
+    if (!neighbor_dump.active) {
+        __real_nl_dump_start(dump, protocol, request);
+        return;
+    }
+    ovs_assert(protocol == NETLINK_ROUTE);
+    ovs_assert(nl_msg_nlmsghdr(request)->nlmsg_type == RTM_GETNEIGH);
+    ovs_assert(!neighbor_dump.started);
+    neighbor_dump.started = true;
+}
+
+bool
+__wrap_nl_dump_next(struct nl_dump *dump, struct ofpbuf *reply,
+                    struct ofpbuf *buf)
+{
+    if (!neighbor_dump.active) {
+        return __real_nl_dump_next(dump, reply, buf);
+    }
+    ovs_assert(neighbor_dump.started && !neighbor_dump.finished);
+    if (neighbor_dump.next == neighbor_dump.n_messages) {
+        return false;
+    }
+    *reply = neighbor_dump.messages[neighbor_dump.next++];
+    return true;
+}
+
+int
+__wrap_nl_dump_done(struct nl_dump *dump)
+{
+    if (!neighbor_dump.active) {
+        return __real_nl_dump_done(dump);
+    }
+    ovs_assert(neighbor_dump.started && !neighbor_dump.finished);
+    neighbor_dump.finished = true;
+    return neighbor_dump.error;
+}
+
+int
+__wrap_nl_transact(int protocol, const struct ofpbuf *request,
+                   struct ofpbuf **reply)
+{
+    if (!neighbor_dump.active) {
+        return __real_nl_transact(protocol, request, reply);
+    }
+    ovs_assert(protocol == NETLINK_ROUTE && !reply);
+    const struct ndmsg *nd = ofpbuf_at(request, NLMSG_HDRLEN, sizeof *nd);
+    ovs_assert(nd && nd->ndm_family == AF_INET && nd->ndm_ifindex == 42);
+    switch (nl_msg_nlmsghdr(request)->nlmsg_type) {
+    case RTM_NEWNEIGH:
+        neighbor_dump.adds++;
+        break;
+    case RTM_DELNEIGH:
+        neighbor_dump.deletes++;
+        break;
+    default:
+        OVS_NOT_REACHED();
+    }
+    return 0;
+}
+
+static struct ofpbuf *
+neighbor_dump_message(void)
+{
+    ovs_assert(neighbor_dump.n_messages < ARRAY_SIZE(neighbor_dump.messages));
+    struct ofpbuf *message =
+        &neighbor_dump.messages[neighbor_dump.n_messages++];
+    ofpbuf_init(message, 128);
+    nl_msg_put_nlmsghdr(message, 0, RTM_NEWNEIGH, 0);
+    return message;
+}
+
+static void
+neighbor_dump_add(uint8_t family, int32_t if_index, uint16_t state,
+                  uint16_t flags, size_t lladdr_len, uint8_t last)
+{
+    struct ofpbuf *message = neighbor_dump_message();
+    struct ndmsg *nd = ofpbuf_put_zeros(message, sizeof *nd);
+    nd->ndm_family = family;
+    nd->ndm_ifindex = if_index;
+    nd->ndm_state = state;
+    ovs_be32 ip = htonl(0xc0000200 | last);
+    if (family == AF_INET) {
+        nl_msg_put_be32(message, NDA_DST, ip);
+    } else {
+        struct in6_addr ip6 = in6_addr_mapped_ipv4(ip);
+        nl_msg_put_in6_addr(message, NDA_DST, &ip6);
+    }
+    uint8_t mac[20] = { 0x02, 0, 0, 0, 0, last };
+    ovs_assert(lladdr_len <= sizeof mac);
+    nl_msg_put_unspec(message, NDA_LLADDR, mac, lladdr_len);
+    struct nlmsghdr *header = nl_msg_nlmsghdr(message);
+    header->nlmsg_flags = flags;
+    header->nlmsg_len = message->size;
+}
+
+static void
+test_neighbor_dump_script(struct ovs_cmdl_context *ctx)
+{
+    const char *scenario = ctx->argv[1];
+    bool complete = !strcmp(scenario, "complete");
+    bool other_interface = !strcmp(scenario, "other-interface");
+    bool other_family = !strcmp(scenario, "other-family");
+    bool malformed = !strcmp(scenario, "malformed");
+    bool filtered = !strcmp(scenario, "filtered-malformed");
+    bool truncated = !strcmp(scenario, "truncated");
+    bool late_error = !strcmp(scenario, "late-error");
+    bool both_errors = !strcmp(scenario, "parse-and-dump-error");
+    ovs_assert(complete || other_interface || other_family || malformed
+               || filtered || truncated || late_error || both_errors);
+
+    struct hmap neighbors = HMAP_INITIALIZER(&neighbors);
+    struct advertise_neighbor_entry desired = {
+        .lladdr = ETH_ADDR_C(02,00,00,00,00,03),
+        .addr = in6_addr_mapped_ipv4(htonl(0xc0000203)),
+    };
+    hmap_insert(&neighbors, &desired.node,
+                advertise_neigh_hash(&desired.lladdr, &desired.addr));
+    struct vector learned =
+        VECTOR_EMPTY_INITIALIZER(struct ne_nl_received_neigh);
+    struct ne_nl_received_neigh sentinel = { .if_index = 17 };
+    vector_push(&learned, &sentinel);
+
+    memset(&neighbor_dump, 0, sizeof neighbor_dump);
+    neighbor_dump.active = true;
+    /* A learned row and an obsolete OVN-owned row precede the fault.  A
+     * successful sync must publish the former, add the desired row and
+     * delete the latter; a failed dump must do none of those operations. */
+    neighbor_dump_add(AF_INET, 42, NUD_REACHABLE, 0, ETH_ADDR_LEN, 1);
+    neighbor_dump_add(AF_INET, 42, NUD_NOARP, 0, ETH_ADDR_LEN, 2);
+    if (other_interface || other_family || malformed || filtered
+        || both_errors) {
+        neighbor_dump_add(other_family ? AF_INET6 : AF_INET,
+                          other_interface ? 43 : 42, NUD_REACHABLE,
+                          filtered ? NLM_F_DUMP_FILTERED : 0, 20, 4);
+    } else if (truncated) {
+        struct ofpbuf *message = neighbor_dump_message();
+        ofpbuf_put_zeros(message, sizeof(struct ndmsg) - 1);
+        nl_msg_nlmsghdr(message)->nlmsg_len = message->size;
+    }
+    neighbor_dump.error = late_error || both_errors ? EINTR : 0;
+
+    int error = ne_nl_sync_neigh(AF_INET, 42, &neighbors, &learned);
+    ovs_assert(neighbor_dump.started && neighbor_dump.finished);
+    neighbor_dump.active = false;
+    bool success = complete || other_interface || other_family;
+    int expected_error = success ? 0 : EPROTO;
+    if (late_error || both_errors) {
+        expected_error = EINTR;
+    }
+    ovs_assert(error == expected_error);
+    ovs_assert(neighbor_dump.adds == (success ? 1 : 0));
+    ovs_assert(neighbor_dump.deletes == (success ? 1 : 0));
+    ovs_assert(hmap_count(&neighbors) == 1);
+    ovs_assert(learned.len == (success ? 2 : 1));
+    const struct ne_nl_received_neigh *rows = learned.buffer;
+    ovs_assert(!memcmp(&rows[0], &sentinel, sizeof sentinel));
+    if (success) {
+        struct eth_addr mac = ETH_ADDR_C(02,00,00,00,00,01);
+        struct in6_addr ip = in6_addr_mapped_ipv4(htonl(0xc0000201));
+        ovs_assert(rows[1].if_index == 42 && rows[1].family == AF_INET);
+        ovs_assert(rows[1].state == NUD_REACHABLE);
+        ovs_assert(eth_addr_equals(rows[1].lladdr, mac));
+        ovs_assert(ipv6_addr_equals(&rows[1].addr, &ip));
+    }
+    for (size_t i = 0; i < neighbor_dump.n_messages; i++) {
+        ofpbuf_uninit(&neighbor_dump.messages[i]);
+    }
+    vector_destroy(&learned);
+    hmap_destroy(&neighbors);
+}
+
+/* A failed dump must not be reported as successful synchronization. */
+static void
+test_neighbor_sync_error(struct ovs_cmdl_context *ctx OVS_UNUSED)
+{
+    struct hmap neighbors = HMAP_INITIALIZER(&neighbors);
+    struct vector learned =
+        VECTOR_EMPTY_INITIALIZER(struct ne_nl_received_neigh);
+    struct ne_nl_received_neigh sentinel = { .if_index = 42 };
+    vector_push(&learned, &sentinel);
+
+    /* This command starts without pooled Netlink sockets.  Exhaust its file
+     * descriptor allowance so the real dump fails before receiving data. */
+    struct rlimit original;
+    ovs_assert(!getrlimit(RLIMIT_NOFILE, &original));
+    struct rlimit limited = original;
+    limited.rlim_cur = 0;
+    ovs_assert(!setrlimit(RLIMIT_NOFILE, &limited));
+    int error = ne_nl_sync_neigh(AF_INET, 0, &neighbors, &learned);
+    ovs_assert(!setrlimit(RLIMIT_NOFILE, &original));
+
+    ovs_assert(error == EMFILE);
+    ovs_assert(learned.len == 1);
+    ovs_assert(!memcmp(learned.buffer, &sentinel, sizeof sentinel));
+    vector_destroy(&learned);
+    hmap_destroy(&neighbors);
+}
 
 static void
 test_neighbor_sync(struct ovs_cmdl_context *ctx)
@@ -488,6 +718,9 @@ test_ovn_netlink(int argc, char *argv[])
 {
     set_program_name(argv[0]);
     static const struct ovs_cmdl_command commands[] = {
+        {"neighbor-dump-script", NULL, 1, 1,
+         test_neighbor_dump_script, OVS_RO},
+        {"neighbor-sync-error", NULL, 0, 0, test_neighbor_sync_error, OVS_RO},
         {"neighbor-sync", NULL, 2, INT_MAX, test_neighbor_sync, OVS_RO},
         {"neighbor-table-notify", NULL, 1, 1,
          test_neighbor_table_notify, OVS_RO},

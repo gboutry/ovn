@@ -291,6 +291,14 @@ tests_ovstest_SOURCES = \
 	northd/test-ipam.c
 
 if HAVE_NETLINK
+# Deterministic dump failures exercise the production synchronization path.
+# Only ovstest uses these wrappers; inactive scripts call the real transport.
+tests_ovstest_LDFLAGS = $(AM_LDFLAGS) \
+	-Wl,--wrap=nl_dump_start \
+	-Wl,--wrap=nl_dump_next \
+	-Wl,--wrap=nl_dump_done \
+	-Wl,--wrap=nl_transact
+
 tests_ovstest_SOURCES += \
 	controller/host-if-monitor.c \
 	controller/host-if-monitor.h \

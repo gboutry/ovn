@@ -14,6 +14,7 @@
  */
 
 #include <config.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <linux/if_ether.h>
 #include <linux/rtnetlink.h>
@@ -48,10 +49,13 @@ static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
 /* Inspired from route_table_dump_one_table() in OVS. */
 typedef void ne_table_handle_msg_callback(const struct ne_table_msg *,
                                           void *aux);
-static void ne_table_dump_one_ifindex(unsigned char address_family,
+static int ne_table_dump_one_ifindex(unsigned char address_family,
                                       int32_t if_index,
                                       ne_table_handle_msg_callback *,
                                       void *aux);
+static int ne_nl_dump_neigh(uint8_t family, int32_t if_index,
+                            struct vector *neighbors);
+
 struct ne_msg_handle_data {
     /* Stores 'struct advertise_neighbor_entry'. */
     struct hmapx *neighbors_to_advertise;
@@ -111,7 +115,21 @@ ne_nl_sync_neigh(uint8_t family, int32_t if_index,
         .stale_neighbors = &stale_neighbors,
         .neighbors = neighbors,
     };
-    ne_table_dump_one_ifindex(family, if_index, handle_ne_msg, &data);
+    struct vector snapshot =
+        VECTOR_EMPTY_INITIALIZER(struct ne_nl_received_neigh);
+    ret = ne_nl_dump_neigh(family, if_index, &snapshot);
+    if (ret) {
+        goto out;
+    }
+
+    struct ne_nl_received_neigh *ne;
+    VECTOR_FOR_EACH_PTR (&snapshot, ne) {
+        struct ne_table_msg msg = {
+            .nlmsg_type = RTM_NEWNEIGH,
+            .nd = *ne,
+        };
+        handle_ne_msg(&msg, &data);
+    }
 
     /* Add any remaining neighbors in the neighbors_to_advertise hmapx to the
      * system table. */
@@ -141,7 +159,6 @@ ne_nl_sync_neigh(uint8_t family, int32_t if_index,
     }
 
     /* Remove any stale neighbors from the system table. */
-    struct ne_nl_received_neigh *ne;
     VECTOR_FOR_EACH_PTR (&stale_neighbors, ne) {
         int err = ne_nl_del_neigh(ne->if_index, ne->family,
                                   &ne->lladdr, &ne->addr,
@@ -163,6 +180,8 @@ ne_nl_sync_neigh(uint8_t family, int32_t if_index,
         }
     }
 
+out:
+    vector_destroy(&snapshot);
     hmapx_destroy(&neighbors_to_advertise);
     vector_destroy(&stale_neighbors);
     return ret;
@@ -220,6 +239,31 @@ ne_is_valid_static_arp(struct ne_nl_received_neigh *ne)
 }
 
 static void
+collect_ne_msg(const struct ne_table_msg *msg, void *data)
+{
+    vector_push(data, &msg->nd);
+}
+
+/* Appends a complete, read-only snapshot of neighbors to 'neighbors'.  On
+ * failure, leaves 'neighbors' unchanged and returns an errno value. */
+static int
+ne_nl_dump_neigh(uint8_t family, int32_t if_index, struct vector *neighbors)
+{
+    struct vector snapshot =
+        VECTOR_EMPTY_INITIALIZER(struct ne_nl_received_neigh);
+    int error = ne_table_dump_one_ifindex(family, if_index, collect_ne_msg,
+                                         &snapshot);
+    if (!error) {
+        const struct ne_nl_received_neigh *ne;
+        VECTOR_FOR_EACH_PTR (&snapshot, ne) {
+            vector_push(neighbors, ne);
+        }
+    }
+    vector_destroy(&snapshot);
+    return error;
+}
+
+static int
 ne_table_dump_one_ifindex(unsigned char address_family, int32_t if_index,
                           ne_table_handle_msg_callback *handle_msg_cb,
                           void *aux)
@@ -228,6 +272,7 @@ ne_table_dump_one_ifindex(unsigned char address_family, int32_t if_index,
     struct ofpbuf request, reply, buf;
     struct ndmsg *rq_msg;
     struct nl_dump dump;
+    int error = 0;
 
     uint8_t request_stub[NETNL_REQ_BUFFER_SIZE];
     ofpbuf_use_stub(&request, request_stub, sizeof request_stub);
@@ -244,24 +289,32 @@ ne_table_dump_one_ifindex(unsigned char address_family, int32_t if_index,
 
     ofpbuf_use_stub(&buf, reply_stub, sizeof reply_stub);
     while (nl_dump_next(&dump, &reply, &buf)) {
-        struct ne_table_msg msg;
-
-        if (ne_table_parse(&reply, &msg)) {
-            struct nlmsghdr *nlmsghdr = nl_msg_nlmsghdr(&reply);
-
-            /* Older kernels do not support filtering.  If so, we
-             * filter ourselves. */
-            if (!(nlmsghdr->nlmsg_flags & NLM_F_DUMP_FILTERED)) {
-                if (msg.nd.family != address_family
-                    || (if_index && msg.nd.if_index != if_index)) {
-                    continue;
-                }
-            }
-            handle_msg_cb(&msg, aux);
+        const struct nlmsghdr *nlmsghdr = ofpbuf_at(&reply, 0, NLMSG_HDRLEN);
+        const struct ndmsg *nd = ofpbuf_at(&reply, NLMSG_HDRLEN, sizeof *nd);
+        if (!nlmsghdr || !nd) {
+            error = EPROTO;
+            break;
         }
+
+        /* Some kernels return unfiltered dumps.  Check the header before
+         * parsing attributes so unrelated non-Ethernet neighbors cannot
+         * abort synchronization of the requested interface. */
+        if (!(nlmsghdr->nlmsg_flags & NLM_F_DUMP_FILTERED)
+            && (nd->ndm_family != address_family
+                || (if_index && nd->ndm_ifindex != if_index))) {
+            continue;
+        }
+
+        struct ne_table_msg msg;
+        if (!ne_table_parse(&reply, &msg)) {
+            error = EPROTO;
+            break;
+        }
+        handle_msg_cb(&msg, aux);
     }
     ofpbuf_uninit(&buf);
-    nl_dump_done(&dump);
+    int dump_error = nl_dump_done(&dump);
+    return dump_error ? dump_error : error;
 }
 
 static int

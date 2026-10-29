@@ -1,5 +1,34 @@
 AT_BANNER([system-ovn-netlink])
 
+AT_SETUP([sync netlink neighbors - failed dump])
+AT_KEYWORDS([netlink-neighbors netlink-dump-error])
+AT_CHECK([ovstest test-ovn-netlink neighbor-sync-error], [0], [], [ignore])
+AT_CLEANUP
+
+AT_SETUP([sync netlink neighbors - filter unrelated dump records])
+AT_KEYWORDS([netlink-neighbors netlink-dump-error])
+check ovstest test-ovn-netlink neighbor-dump-script other-interface
+check ovstest test-ovn-netlink neighbor-dump-script other-family
+AT_CLEANUP
+
+AT_SETUP([sync netlink neighbors - malformed dump records])
+AT_KEYWORDS([netlink-neighbors netlink-dump-error])
+check ovstest test-ovn-netlink neighbor-dump-script malformed
+check ovstest test-ovn-netlink neighbor-dump-script filtered-malformed
+check ovstest test-ovn-netlink neighbor-dump-script truncated
+AT_CLEANUP
+
+AT_SETUP([sync netlink neighbors - partial dump rollback])
+AT_KEYWORDS([netlink-neighbors netlink-dump-error])
+check ovstest test-ovn-netlink neighbor-dump-script late-error
+check ovstest test-ovn-netlink neighbor-dump-script parse-and-dump-error
+AT_CLEANUP
+
+AT_SETUP([sync netlink neighbors - complete dump publication])
+AT_KEYWORDS([netlink-neighbors netlink-dump-error])
+check ovstest test-ovn-netlink neighbor-dump-script complete
+AT_CLEANUP
+
 AT_SETUP([sync netlink neighbors - learn VXLAN VTEP neighbors])
 AT_KEYWORDS([netlink-neighbors])
 
