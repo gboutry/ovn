@@ -248,8 +248,8 @@ dynamic_routes_track_od(struct dynamic_routes_data *data,
 
 /* Install a parsed_route on advertising_od that forwards ip_address (a
  * LB VIP or NAT external IP) through advertising_op toward tracked_port,
- * where tracked_port must be a peer LRP on the shared LS so that its
- * first matching-family network address is a valid nexthop.
+ * where tracked_port must be a peer LRP with a matching-family address.
+ * Use its first address as nexthop unless nexthop_override is provided.
  *
  * Used by the connected-neighbour redistribution paths
  * (build_{lb,nat}_connected_routes) so the advertising LR can
@@ -272,6 +272,7 @@ add_redistribute_parsed_route(struct hmap *parsed_routes_out,
                               const struct ovn_port *advertising_op,
                               const struct ovn_port *tracked_port,
                               const char *ip_address,
+                              const char *nexthop_override,
                               enum route_source source,
                               const struct ovsdb_idl_row *source_hint)
 {
@@ -311,6 +312,10 @@ add_redistribute_parsed_route(struct hmap *parsed_routes_out,
                      source == ROUTE_SOURCE_LB ? "LB" : "NAT",
                      ip_address);
         return;
+    }
+
+    if (nexthop_override) {
+        nexthop_s = nexthop_override;
     }
 
     /* If advertising_op has an address in the nexthop's family, use it as
@@ -408,9 +413,20 @@ build_nat_route_for_port(const struct ovn_port *advertising_op,
         }
 
         if (forwarding_port && parsed_routes_out) {
+            const char *nexthop_override = NULL;
+            if (nat->is_distributed &&
+                forwarding_port == nat->l3dgw_port &&
+                advertising_op->peer && advertising_op->peer->nbsp) {
+                /* On the shared external LS, the FIP's external MAC
+                 * delivers to the backend's chassis.  Resolving the DGP's
+                 * IP instead selects its gateway MAC and gateway chassis.
+                 * A separate transit peer still needs its own LRP IP. */
+                nexthop_override = nat->nb->external_ip;
+            }
             add_redistribute_parsed_route(parsed_routes_out, advertising_od,
                                           advertising_op, forwarding_port,
                                           nat->nb->external_ip,
+                                          nexthop_override,
                                           ROUTE_SOURCE_NAT,
                                           &nat->nb->header_);
         }
@@ -557,7 +573,7 @@ build_lb_routes_for_lb(const struct ovn_port *advertising_op,
         if (parsed_routes_out) {
             add_redistribute_parsed_route(
                 parsed_routes_out, advertising_od, advertising_op,
-                fallback_tracked_port, vip->vip_str, ROUTE_SOURCE_LB,
+                fallback_tracked_port, vip->vip_str, NULL, ROUTE_SOURCE_LB,
                 &nbrec_lb->header_);
         }
 

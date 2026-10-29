@@ -16794,6 +16794,153 @@ AT_CLEANUP
 ])
 
 OVN_FOR_EACH_NORTHD([
+AT_SETUP([dynamic-routing - distributed NAT next hop on shared localnet])
+AT_KEYWORDS([dynamic-routing distributed-nat-nexthop])
+AT_SKIP_IF([test $HAVE_TCPDUMP = no])
+CHECK_CONNTRACK()
+CHECK_CONNTRACK_NAT()
+VRF_RESERVE([1344])
+
+ovn_start
+OVS_TRAFFIC_VSWITCHD_START()
+ADD_BR([br-int])
+ADD_BR([br-shared], [set Bridge br-shared fail-mode=standalone])
+check ovs-vsctl \
+    -- set Open_vSwitch . external-ids:system-id=hv1 \
+        external-ids:ovn-remote=unix:$ovs_base/ovn-sb/ovn-sb.sock \
+        external-ids:ovn-encap-type=geneve \
+        external-ids:ovn-encap-ip=169.0.0.1 \
+        external-ids:ovn-bridge-mappings=shared:br-shared \
+    -- set Bridge br-int fail-mode=secure \
+        other-config:disable-in-band=true
+start_daemon ovn-controller
+
+dnl The backend and advertising router are local. The distributed gateway
+dnl belongs to another chassis, so sending to its MAC cannot reach the VM.
+check ovn-sbctl chassis-add hv2 geneve 169.0.0.2
+OVS_WAIT_UNTIL([
+    tunnel_ofport=$(ovs-vsctl --bare --columns=ofport find Interface \
+        options:local_ip=169.0.0.1 options:remote_ip=169.0.0.2)
+    test -n "$tunnel_ofport" && test "$tunnel_ofport" -ge 0
+])
+
+check ovn-nbctl \
+    -- lr-add adv \
+    -- set Logical_Router adv options:chassis=hv1 \
+        options:dynamic-routing=true options:dynamic-routing-vrf-id=1344 \
+        options:mac_binding_age_threshold=0 \
+    -- lrp-add adv adv-client 00:00:00:00:aa:02 192.0.2.1/24 \
+    -- ls-add clients \
+    -- lsp-add-router-port clients clients-adv adv-client \
+    -- lsp-add clients client \
+    -- lsp-set-addresses client '00:00:00:00:cc:02 192.0.2.2' \
+    -- lrp-add adv adv-shared 00:00:00:00:aa:01 \
+    -- lrp-set-options adv-shared dynamic-routing-maintain-vrf=true \
+        dynamic-routing-redistribute=nat \
+    -- ls-add shared \
+    -- lsp-add-router-port shared shared-adv adv-shared \
+    -- lsp-add-localnet-port shared shared-localnet shared \
+    -- lr-add tenant \
+    -- lrp-add tenant tenant-shared 00:00:00:00:bb:01 172.16.1.1/24 \
+    -- lsp-add-router-port shared shared-tenant tenant-shared \
+    -- set Logical_Switch_Port shared-tenant options:nat-addresses=router \
+    -- lrp-set-gateway-chassis tenant-shared hv2 \
+    -- lrp-add tenant tenant-vms 00:00:00:00:bb:02 10.0.0.1/24 \
+    -- ls-add vms \
+    -- lsp-add-router-port vms vms-tenant tenant-vms \
+    -- lsp-add vms vm \
+    -- lsp-set-addresses vm '00:00:00:00:dd:02 10.0.0.2' \
+    -- lr-route-add tenant 192.0.2.0/24 fe80::200:ff:fe00:aa01 tenant-shared \
+    -- lr-nat-add tenant dnat_and_snat 172.16.1.100 10.0.0.2 \
+        vm 00:00:00:00:ee:01
+
+ADD_NAMESPACES(client, vm)
+ADD_VETH(client, client, br-int, "192.0.2.2/24", \
+         "00:00:00:00:cc:02", "192.0.2.1")
+ADD_VETH(vm, vm, br-int, "10.0.0.2/24", \
+         "00:00:00:00:dd:02", "10.0.0.1")
+check ovn-nbctl --wait=hv sync
+wait_for_ports_up client vm
+wait_row_count Port_Binding 1 logical_port=cr-tenant-shared
+hv1=$(fetch_column Chassis _uuid name=hv1)
+hv2=$(fetch_column Chassis _uuid name=hv2)
+check ovn-sbctl set Port_Binding cr-tenant-shared chassis=$hv2
+check ovn-nbctl --wait=hv sync
+check_row_count Port_Binding 1 logical_port=vm chassis=$hv1
+check_row_count Port_Binding 1 logical_port=cr-tenant-shared chassis=$hv2
+OVN_ROUTE_EQUAL([ovnvrf1344], [dnl
+blackhole 172.16.1.100 proto ovn metric 100])
+
+AS_BOX([Cold ARP and traffic use the distributed NAT next hop])
+check ovn-sbctl --all destroy MAC_Binding
+NS_CHECK_EXEC([client], [ip neigh flush dev client])
+NS_CHECK_EXEC([vm], [ip neigh flush dev vm])
+NETNS_START_TCPDUMP([client], [-nnei client -c 1 arp], [client-arp])
+NS_CHECK_EXEC([client], [ping -q -c 3 -i 0.3 -w 3 172.16.1.100 | FORMAT_PING],
+    [0], [dnl
+3 packets transmitted, 3 received, 0% packet loss, time 0ms
+])
+OVS_WAIT_UNTIL([grep -F 'Request who-has 192.0.2.1 tell 192.0.2.2' \
+    client-arp.tcpdump])
+wait_row_count MAC_Binding 1 logical_port=adv-shared \
+    ip='"172.16.1.100"' mac='"00:00:00:00:ee:01"'
+
+AS_BOX([Distributed NAT bypasses the remote redirect chassis])
+check ovn-nbctl --wait=hv set Logical_Router_Port tenant-shared \
+    options:reside-on-redirect-chassis=true
+NS_CHECK_EXEC([client], [ping -q -c 3 -i 0.3 -w 3 172.16.1.100 | FORMAT_PING],
+    [0], [dnl
+3 packets transmitted, 3 received, 0% packet loss, time 0ms
+])
+
+AS_BOX([Native GARP refreshes a warm next hop after its MAC changes])
+nat=$(fetch_column nb:NAT _uuid external_ip='"172.16.1.100"')
+check ovn-nbctl --wait=hv set NAT $nat external_mac='"00:00:00:00:ee:02"'
+wait_row_count MAC_Binding 1 logical_port=adv-shared \
+    ip='"172.16.1.100"' mac='"00:00:00:00:ee:02"'
+check_row_count MAC_Binding 0 logical_port=adv-shared \
+    ip='"172.16.1.100"' mac='"00:00:00:00:ee:01"'
+NS_CHECK_EXEC([client], [ping -q -c 3 -i 0.3 -w 3 172.16.1.100 | FORMAT_PING],
+    [0], [dnl
+3 packets transmitted, 3 received, 0% packet loss, time 0ms
+])
+
+AS_BOX([Resolve the changed MAC again with cold caches])
+check ovn-sbctl --all destroy MAC_Binding
+NS_CHECK_EXEC([client], [ip neigh flush dev client])
+NS_CHECK_EXEC([vm], [ip neigh flush dev vm])
+NS_CHECK_EXEC([client], [ping -q -c 3 -i 0.3 -w 3 172.16.1.100 | FORMAT_PING],
+    [0], [dnl
+3 packets transmitted, 3 received, 0% packet loss, time 0ms
+])
+
+AS_BOX([Changing and removing the FIP withdraws its old route])
+check ovn-nbctl --wait=hv set NAT $nat external_ip='"172.16.1.101"'
+OVN_ROUTE_EQUAL([ovnvrf1344], [dnl
+blackhole 172.16.1.101 proto ovn metric 100])
+check ovn-sbctl --all destroy MAC_Binding
+NS_CHECK_EXEC([client], [ip neigh flush dev client])
+NS_CHECK_EXEC([vm], [ip neigh flush dev vm])
+NS_CHECK_EXEC([client], [ping -q -c 3 -i 0.3 -w 3 172.16.1.101 | FORMAT_PING],
+    [0], [dnl
+3 packets transmitted, 3 received, 0% packet loss, time 0ms
+])
+NS_CHECK_EXEC([client], [ping -q -c 1 -W 1 172.16.1.100],
+    [1], [ignore], [ignore])
+check ovn-nbctl --wait=hv lr-nat-del tenant dnat_and_snat 172.16.1.101
+OVS_WAIT_UNTIL([ip route list vrf ovnvrf1344 > routes && test ! -s routes])
+NS_CHECK_EXEC([client], [ping -q -c 1 -W 1 172.16.1.101],
+    [1], [ignore], [ignore])
+
+OVN_CLEANUP_CONTROLLER([hv1])
+OVN_CLEANUP_NORTHD
+as
+OVS_TRAFFIC_VSWITCHD_STOP(["/failed to query port patch-.*/d
+/connection dropped.*/d"])
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([dynamic-routing - DNAT and DNAT_AND_SNAT on gateway router IPv6])
 AT_KEYWORDS([dynamic-routing])
 
